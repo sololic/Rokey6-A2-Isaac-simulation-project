@@ -46,6 +46,7 @@ import sys
 import asyncio
 import math
 import random
+import socket
 
 from isaacsim import SimulationApp
 
@@ -156,6 +157,54 @@ HOME_POSE_DEG = {
     "wrist_3_joint":        0.0,
 }
 
+# ── 구역별 사전 정의 팔 자세 (도 단위) ──────────────────────────────────
+# 이미지 2×2 격자 → Zone 0~3 → 마커 위치에 맞춘 팔 자세
+# 마커 위치: (-0.8,2.0) / (0.8,2.0) / (0.8,3.0) / (-0.8,3.0)
+# 실제 시뮬 후 pan/lift 값 튜닝 필요 (현재값: 기하학적 추정)
+ZONE_POSES = [
+    {   # Zone 0: 이미지 좌상 (x<0, y>0) → CrackMarker_0 (좌근)
+        # "reach" 포즈 베이스 + pan -30° (왼쪽)
+        "shoulder_pan_joint":  -30.0,
+        "shoulder_lift_joint": -45.0,
+        "elbow_joint":         -60.0,
+        "wrist_1_joint":       -75.0,
+        "wrist_2_joint":        90.0,
+        "wrist_3_joint":         0.0,
+    },
+    {   # Zone 1: 이미지 우상 (x>0, y>0) → CrackMarker_1 (우근)
+        # "reach" 포즈 베이스 + pan +30° (오른쪽)
+        "shoulder_pan_joint":   30.0,
+        "shoulder_lift_joint": -45.0,
+        "elbow_joint":         -60.0,
+        "wrist_1_joint":       -75.0,
+        "wrist_2_joint":        90.0,
+        "wrist_3_joint":         0.0,
+    },
+    {   # Zone 2: 이미지 우하 (x>0, y<0) → CrackMarker_2 (우원)
+        # "reach" 포즈 베이스 + pan +30° (오른쪽)
+        "shoulder_pan_joint":   30.0,
+        "shoulder_lift_joint": -45.0,
+        "elbow_joint":         -60.0,
+        "wrist_1_joint":       -75.0,
+        "wrist_2_joint":        90.0,
+        "wrist_3_joint":         0.0,
+    },
+    {   # Zone 3: 이미지 좌하 (x<0, y<0) → CrackMarker_3 (좌원)
+        # "reach" 포즈 베이스 + pan -30° (왼쪽)
+        "shoulder_pan_joint":  -30.0,
+        "shoulder_lift_joint": -45.0,
+        "elbow_joint":         -60.0,
+        "wrist_1_joint":       -75.0,
+        "wrist_2_joint":        90.0,
+        "wrist_3_joint":         0.0,
+    },
+]
+
+# ── 구역 분류 오류 처리 파라미터 ─────────────────────────────────────────
+ZONE_BOUNDARY = 0.08   # 경계 여유 (이 안쪽이면 이전 구역 유지, hysteresis)
+ZONE_CONFIRM  = 3      # N프레임 연속 같은 구역이어야 전환 확정
+ZONE_TIMEOUT  = 3.0    # 미감지 N초 후 HOME 복귀
+
 
 class JackalUR10UnderwaterDemo:
     """Jackal + UR10 수중 용접 로봇 데모"""
@@ -184,6 +233,13 @@ class JackalUR10UnderwaterDemo:
 
         # 토치 경로
         self._torch_path = None
+
+        # 균열 추종 (UDP 수신)
+        self._crack_sock     = None
+        self._crack_x        = 0.0   # 정규화 좌우 (-1~1)
+        self._crack_y        = 0.0   # 정규화 상하 (-1~1)
+        self._crack_detected = False
+        self._target_prim    = None  # 타겟 구체 (SphereLight)
 
     # ─────────────────────────────────────────────────────────────────────
     #  유틸: prim 트리 출력
@@ -562,6 +618,281 @@ class JackalUR10UnderwaterDemo:
         self.set_wheel_velocity(0.0, 0.0)
 
     # ─────────────────────────────────────────────────────────────────────
+    #  균열 추종: UDP 수신 + 타겟 구체 + 내비게이션
+    # ─────────────────────────────────────────────────────────────────────
+    def _setup_crack_receiver(self):
+        self._crack_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._crack_sock.bind(('127.0.0.1', 9998))
+        self._crack_sock.setblocking(False)
+        print("  ✓ Crack receiver UDP:9998 준비")
+
+    def _create_target_sphere(self, stage):
+        """타겟 위치에 주황 발광 구체 (SphereLight) 생성"""
+        path = '/World/CrackTarget'
+        light = UsdLux.SphereLight.Define(stage, path)
+        light.GetRadiusAttr().Set(0.2)
+        light.GetIntensityAttr().Set(8000.0)
+        light.GetColorAttr().Set(Gf.Vec3f(1.0, 0.4, 0.0))   # 주황
+        xf = UsdGeom.Xformable(stage.GetPrimAtPath(path))
+        xf.AddTranslateOp().Set(Gf.Vec3d(3.0, 0.0, 0.3))
+        print("  ✓ 타겟 구체(SphereLight) 생성: /World/CrackTarget")
+        return stage.GetPrimAtPath(path)
+
+    def _create_crack_markers(self, stage):
+        """Jackal 앞 고정 위치에 균열 마커 4개 생성 (빨간 테두리 프레임)
+        - 속이 빈 정사각형 프레임: 4개 얇은 막대로 구성
+        - 프레임은 XZ 평면 (세로로 서있음, Y 방향에서 보임)
+        """
+        # Jackal 앞 가까운 사각형 배치 (Y=1.5~2.5m 앞)
+        centers = [
+            (-0.8, 2.0),   # 좌근  ← 이미지 (-0.55, +0.15)
+            ( 0.8, 2.0),   # 우근  ← 이미지 (+0.55, +0.15)
+            ( 0.8, 3.0),   # 우원  ← 이미지 (+0.55, -0.15)
+            (-0.8, 3.0),   # 좌원  ← 이미지 (-0.55, -0.15)
+        ]
+        S  = 0.35   # 프레임 한 변 길이 (m)
+        T  = 0.025  # 막대 두께 (m)
+        CZ = 0.25   # 프레임 중심 높이 (바닥 기준)
+        color = Gf.Vec3f(1.0, 0.15, 0.15)   # 선명한 빨강
+
+        # 프레임 4개 막대 정의: (dx, dz, sx, sz)
+        # dx/dz = 프레임 중심 대비 막대 중심 오프셋, sx/sz = 막대 스케일
+        bars = [
+            ( 0,      S/2,   S,  T ),   # 위 가로
+            ( 0,     -S/2,   S,  T ),   # 아래 가로
+            (-S/2,    0,     T,  S ),   # 왼쪽 세로
+            ( S/2,    0,     T,  S ),   # 오른쪽 세로
+        ]
+
+        for i, (cx, cy) in enumerate(centers):
+            for j, (dx, dz, sx, sz) in enumerate(bars):
+                path = f'/World/CrackMarker_{i}_bar{j}'
+                box  = UsdGeom.Cube.Define(stage, path)
+                box.GetSizeAttr().Set(1.0)
+                xf = UsdGeom.Xformable(stage.GetPrimAtPath(path))
+                xf.AddTranslateOp().Set(Gf.Vec3d(cx + dx, cy, CZ + dz))
+                xf.AddScaleOp().Set(Gf.Vec3d(sx, T, sz))   # y=T(얇음)
+                box.GetDisplayColorAttr().Set([color])
+
+        print(f"  ✓ 균열 마커 4개 생성 (테두리 프레임, Jackal 앞 Y=1.5~2.5m)")
+
+    def _create_weld_path(self, stage):
+        """용접 이동 경로 시각화
+        - 마커 연결 노란 경로선 (0→1→2→3→0)
+        - 꼭짓점 순번 구체 (초록→노랑→주황→빨강)
+        - 현재 활성 구역을 따라가는 흰 인디케이터 구체
+        """
+        CZ = 0.25    # 마커 중심 높이
+        T  = 0.018   # 경로선 두께
+
+        # 마커 중심 XY 좌표 (순서 = 용접 순서)
+        MARKER_XY = [
+            (-0.8, 2.0),  # Zone 0 (1번)
+            ( 0.8, 2.0),  # Zone 1 (2번)
+            ( 0.8, 3.0),  # Zone 2 (3번)
+            (-0.8, 3.0),  # Zone 3 (4번)
+        ]
+
+        # ── 경로 구간 선 (얇은 Cube, 마커 중심끼리 연결) ────────────────
+        SEG_COLORS = [
+            Gf.Vec3f(1.0, 0.85, 0.0),   # 0→1 노랑
+            Gf.Vec3f(1.0, 0.85, 0.0),   # 1→2 노랑
+            Gf.Vec3f(1.0, 0.85, 0.0),   # 2→3 노랑
+            Gf.Vec3f(0.55, 0.55, 0.55), # 3→0 회색 (복귀선 구분)
+        ]
+        for i in range(4):
+            x1, y1 = MARKER_XY[i]
+            x2, y2 = MARKER_XY[(i + 1) % 4]
+            cx = (x1 + x2) / 2.0
+            cy = (y1 + y2) / 2.0
+            sx = max(abs(x2 - x1), T)
+            sy = max(abs(y2 - y1), T)
+            seg_path = f'/World/WeldPath/seg_{i}'
+            box = UsdGeom.Cube.Define(stage, seg_path)
+            box.GetSizeAttr().Set(1.0)
+            xf = UsdGeom.Xformable(stage.GetPrimAtPath(seg_path))
+            xf.AddTranslateOp().Set(Gf.Vec3d(cx, cy, CZ))
+            xf.AddScaleOp().Set(Gf.Vec3d(sx, sy, T))
+            box.GetDisplayColorAttr().Set([SEG_COLORS[i]])
+
+        # ── 꼭짓점 순번 구체 (마커 위쪽에 배치) ────────────────────────
+        ORDER_COLORS = [
+            Gf.Vec3f(0.2, 1.0, 0.2),   # 1번: 초록
+            Gf.Vec3f(1.0, 1.0, 0.0),   # 2번: 노랑
+            Gf.Vec3f(1.0, 0.5, 0.0),   # 3번: 주황
+            Gf.Vec3f(1.0, 0.2, 0.2),   # 4번: 빨강
+        ]
+        for i, (mx, my) in enumerate(MARKER_XY):
+            num_path = f'/World/WeldPath/num_{i}'
+            sphere = UsdGeom.Sphere.Define(stage, num_path)
+            sphere.GetRadiusAttr().Set(0.055)
+            xf = UsdGeom.Xformable(stage.GetPrimAtPath(num_path))
+            xf.AddTranslateOp().Set(Gf.Vec3d(mx, my, CZ + 0.28))  # 마커 위
+            sphere.GetDisplayColorAttr().Set([ORDER_COLORS[i]])
+
+        # ── 현재위치 인디케이터 (흰 구체, crack_follow_loop에서 이동) ──
+        ind_path = '/World/WeldPath/indicator'
+        sphere = UsdGeom.Sphere.Define(stage, ind_path)
+        sphere.GetRadiusAttr().Set(0.08)
+        xf = UsdGeom.Xformable(stage.GetPrimAtPath(ind_path))
+        xf.AddTranslateOp().Set(Gf.Vec3d(MARKER_XY[0][0], MARKER_XY[0][1], CZ))
+        sphere.GetDisplayColorAttr().Set([Gf.Vec3f(1.0, 1.0, 1.0)])
+
+        print("  ✓ 용접 경로 시각화: 경로선 4구간 + 순번 구체 (초록→노랑→주황→빨강) + 흰 인디케이터")
+
+    def _move_weld_indicator(self, zone):
+        """현재 활성 구역으로 흰 인디케이터 구체 이동"""
+        MARKER_XY = [(-0.8, 2.0), (0.8, 2.0), (0.8, 3.0), (-0.8, 3.0)]
+        stage = omni.usd.get_context().get_stage()
+        ind_prim = stage.GetPrimAtPath('/World/WeldPath/indicator')
+        if not ind_prim.IsValid():
+            return
+        if zone < 0:
+            pos = Gf.Vec3f(0.0, 0.0, -2.0)   # HOME: 바닥 아래로 숨김
+        else:
+            mx, my = MARKER_XY[zone]
+            pos = Gf.Vec3f(mx, my, 0.25)
+        attr = ind_prim.GetAttribute("xformOp:translate")
+        if attr and attr.IsValid():
+            attr.Set(pos)
+
+    def _recv_crack(self):
+        """논블로킹 UDP 수신"""
+        if self._crack_sock is None:
+            return
+        try:
+            data, _ = self._crack_sock.recvfrom(64)
+            msg = data.decode().strip()
+            if msg == 'none':
+                self._crack_detected = False
+            else:
+                x, y = map(float, msg.split(','))
+                self._crack_x = x
+                self._crack_y = y
+                self._crack_detected = True
+        except BlockingIOError:
+            pass
+
+    def _update_target_sphere(self, stage):
+        """로봇 앞 crack_x 방향으로 타겟 구체 이동"""
+        if self._target_prim is None or not self._target_prim.IsValid():
+            return
+        body_prim = stage.GetPrimAtPath('/jackal/base_link')
+        if not body_prim.IsValid():
+            return
+        xform_cache = UsdGeom.XformCache()
+        world_tf    = xform_cache.GetLocalToWorldTransform(body_prim)
+        pos         = world_tf.ExtractTranslation()
+        fwd         = world_tf.TransformDir(Gf.Vec3d(1, 0, 0))
+        right       = world_tf.TransformDir(Gf.Vec3d(0, 1, 0))
+        target = Gf.Vec3d(
+            pos[0] + 2.5 * fwd[0] + self._crack_x * 1.5 * right[0],
+            pos[1] + 2.5 * fwd[1] + self._crack_x * 1.5 * right[1],
+            0.3,
+        )
+        ops = UsdGeom.Xformable(self._target_prim).GetOrderedXformOps()
+        for op in ops:
+            if 'translate' in op.GetOpName():
+                op.Set(target)
+                return
+        UsdGeom.Xformable(self._target_prim).AddTranslateOp().Set(target)
+
+    async def crack_follow_loop(self):
+        """균열 위치(이미지 좌표) → UR10 관절 제어
+        - Jackal 정지 상태 유지
+        - 이미지 x → shoulder_pan (좌우 회전)
+        - 이미지 y → shoulder_lift (상하 이동)
+        """
+        print("\n[Crack Follow Mode] 구역 기반 UR10 포즈 추종 시작")
+        print("  이미지 2×2 격자 → Zone 0~3 → 사전 정의 팔 자세")
+        self.stop_wheels()
+
+        dt            = 0.05
+        last_zone     = -1    # 현재 확정 구역 (-1: 없음)
+        candidate     = -1    # 후보 구역
+        confirm_count = 0     # 연속 확인 프레임 수
+        no_detect_t   = 0.0   # 미감지 누적 시간 (초)
+
+        while True:
+            self._recv_crack()
+
+            if self._crack_detected:
+                no_detect_t = 0.0
+                zone = self._classify_zone(self._crack_x, self._crack_y)
+
+                if zone == -1:
+                    # 경계: 이전 구역 유지 (hysteresis)
+                    zone = last_zone
+
+                # N프레임 연속 같은 구역이어야 전환 확정
+                if zone == candidate:
+                    confirm_count += 1
+                else:
+                    candidate     = zone
+                    confirm_count = 1
+
+                if confirm_count >= ZONE_CONFIRM and zone != last_zone and zone >= 0:
+                    last_zone = zone
+                    print(f"  → Zone {zone} 확정: CrackMarker_{zone} 로 팔 이동")
+                    self._move_weld_indicator(zone)   # 경로 인디케이터 이동
+                    await self._move_to_zone_pose(zone)
+
+            else:
+                # 미감지 타임아웃 → HOME 복귀
+                no_detect_t += dt
+                if no_detect_t >= ZONE_TIMEOUT and last_zone >= 0:
+                    print(f"  ⚠ {ZONE_TIMEOUT:.0f}초 미감지 → HOME 복귀")
+                    self._move_weld_indicator(-1)     # 인디케이터 숨김
+                    await self._move_to_zone_pose(-1)
+                    last_zone     = -1
+                    candidate     = -1
+                    confirm_count = 0
+                    no_detect_t   = 0.0
+
+            await asyncio.sleep(dt)
+
+    def _classify_zone(self, nx, ny):
+        """정규화 이미지 좌표 → 구역 인덱스
+        Returns:
+            0 = 좌상 (x<0, y>0)
+            1 = 우상 (x>0, y>0)
+            2 = 우하 (x>0, y<0)
+            3 = 좌하 (x<0, y<0)
+           -1 = 경계 (이전 구역 유지)
+        """
+        if abs(nx) < ZONE_BOUNDARY or abs(ny) < ZONE_BOUNDARY:
+            return -1   # 경계 근처: hysteresis
+        if   nx < 0 and ny > 0:  return 0
+        elif nx > 0 and ny > 0:  return 1
+        elif nx > 0 and ny < 0:  return 2
+        else:                    return 3
+
+    async def _move_to_zone_pose(self, zone, duration=3.0):
+        """구역 포즈로 smoothstep 보간 이동
+        zone=-1 이면 HOME 복귀
+        """
+        if not hasattr(self, '_arm_joint_map'):
+            print("  ⚠ _arm_joint_map 없음: 팔 이동 불가")
+            return
+
+        pose_deg = HOME_POSE_DEG if zone < 0 else ZONE_POSES[zone]
+
+        current = self.robot.get_joint_positions().copy()
+        target  = current.copy()
+        for jname, deg in pose_deg.items():
+            idx = self._arm_joint_map.get(jname)
+            if idx is not None:
+                target[idx] = np.deg2rad(deg)
+
+        steps = max(1, int(duration / 0.05))
+        for s in range(steps):
+            t      = (s + 1) / steps
+            alpha  = t * t * (3.0 - 2.0 * t)   # smoothstep
+            interp = current + alpha * (target - current)
+            self.robot.apply_action(ArticulationAction(joint_positions=interp))
+            await asyncio.sleep(0.05)
+
+    # ─────────────────────────────────────────────────────────────────────
     #  물리 콜백 (파도력)
     # ─────────────────────────────────────────────────────────────────────
     def physics_step_callback(self, step_size):
@@ -666,15 +997,7 @@ class JackalUR10UnderwaterDemo:
         print(f"\nLoading USD: {USD_PATH}")
         omni.usd.get_context().open_stage(USD_PATH)
 
-        # 깨진 FixedJoint 제거 (Franka panda_link0 참조 → 존재하지 않는 prim → 에러 발생)
-        try:
-            stage = omni.usd.get_context().get_stage()
-            broken_joint = stage.GetPrimAtPath("/jackal/FixedJoint")
-            if broken_joint.IsValid():
-                stage.RemovePrim("/jackal/FixedJoint")
-                print("  ✓ /jackal/FixedJoint 제거 (Franka 잔재, 불필요한 에러 원인)")
-        except Exception as e:
-            print(f"  ⚠ FixedJoint 제거 실패: {e}")
+        # /jackal/FixedJoint 는 UR10-Jackal 연결 조인트 → 제거 금지 (DOF 10개 유지)
 
         # Jackal 스폰 위치/방향 초기화: z=0.3으로 올리고 회전은 identity로 리셋
         try:
@@ -743,6 +1066,14 @@ class JackalUR10UnderwaterDemo:
         print("Getting Jackal+UR10 articulation...")
         self.robot = Articulation(prim_path="/jackal")
 
+        # 균열 추종 준비
+        stage = omni.usd.get_context().get_stage()
+        self._setup_crack_receiver()
+        # SphereLight 생성 건너뜀 (xformOpOrder 경고 방지, 마커로 대체)
+        self._target_prim = None
+        self._create_crack_markers(stage)
+        self._create_weld_path(stage)
+
         print("\n✓ Setup complete")
 
     # ─────────────────────────────────────────────────────────────────────
@@ -773,6 +1104,7 @@ class JackalUR10UnderwaterDemo:
             name: i for i, name in enumerate(dof_names)
             if name in UR10_JOINT_NAMES
         }
+        self._arm_joint_map = arm_joint_map   # crack_follow_loop에서 사용
         print(f"  UR10 joint map: {arm_joint_map}")
 
         # ── UR10 팔 즉시 스폰 자세로 텔레포트 (이름 기반, 슬라이스 금지) ──
@@ -878,41 +1210,12 @@ class JackalUR10UnderwaterDemo:
         print("\n[Phase 1] 홈 포지션으로 이동 (shoulder_lift 0°→-90°, 6초)")
         await move_arm("home", 6.0)
 
-        # ── Phase 2: Jackal 전진 + 팔 뻗기 ─────────────────────────
-        print("\n[Phase 2] Jackal 전진 + 팔 도달")
-        self.set_wheel_velocity(WHEEL_VELOCITY)
-        print(f"  ✓ 바퀴 속도: {WHEEL_VELOCITY} rad/s (좌+{WHEEL_VELOCITY}, 우+{WHEEL_VELOCITY})")
-        await move_arm("reach", 5.0)
-        await asyncio.sleep(3.0)
-
-        # ── Phase 3: 용접 작업 (좌우 스윙) ─────────────────────────
-        print("\n[Phase 3] 수중 용접 시작 (좌우 반복)")
-        self.stop_wheels()
-        for cycle in range(3):
-            print(f"  [용접 사이클 {cycle+1}/3]")
-            await move_arm("weld_pos", 3.0)
-            await asyncio.sleep(0.5)
-            await move_arm("weld_neg", 3.0)
-            await asyncio.sleep(0.5)
-
-        # ── Phase 4: 팔 복귀 + 후진 ────────────────────────────────
-        print("\n[Phase 4] 팔 복귀 + 후진")
-        await move_arm("retract", 4.0)
-        self.set_wheel_velocity(-WHEEL_VELOCITY * 0.7)  # 후진
-        await asyncio.sleep(3.0)
-        self.stop_wheels()
-
-        # ── Phase 5: 홈 복귀 ────────────────────────────────────────
-        print("\n[Phase 5] 홈 포지션 복귀")
-        await move_arm("home", 4.0)
-        await asyncio.sleep(2.0)
-
-        print("\n" + "=" * 70)
-        print("DEMO COMPLETE!")
-        print("  - Jackal 주행 완료")
-        print("  - UR10 수중 용접 시퀀스 완료")
-        print("  - 파도력 / 버블 / 잔해 시뮬레이션 유지 중")
-        print("=" * 70)
+        # ── Phase 2: 균열 추종 모드 (무한 루프) ─────────────────────
+        print("\n[Phase 2] 균열 추종 모드 시작 (UDP:9998 수신)")
+        print("  crack_to_socket.py 가 실행 중이면 자동으로 Jackal이 따라갑니다.")
+        await move_arm("reach", 4.0)   # 팔 용접 자세로
+        print("✓ 균열 추종 루프 시작 (Ctrl+C 로 종료)")
+        await self.crack_follow_loop()  # await로 무한 루프 (종료까지 여기서 대기)
 
     def run(self):
         self.setup()
