@@ -22,7 +22,12 @@ import socket
 
 from isaacsim import SimulationApp
 
-CONFIG = {"headless": False, "width": 1920, "height": 1080}
+CONFIG = {
+    "headless": False,
+    "width": 1920,
+    "height": 1080,
+    "extra_args": ["--enable", "omni.isaac.ros2_bridge"]
+}
 simulation_app = SimulationApp(CONFIG)
 
 import omni.usd
@@ -55,10 +60,10 @@ HOME_POSE_DEG = {
 }
 
 REACH_POSE_DEG = {
-    "shoulder_pan_joint":   0.0,
-    "shoulder_lift_joint": -45.0,
-    "elbow_joint":         -60.0,
-    "wrist_1_joint":       -75.0,
+    "shoulder_pan_joint":   90.0,
+    "shoulder_lift_joint":  -90.0,
+    "elbow_joint":         90.0,
+    "wrist_1_joint":       0.0,
     "wrist_2_joint":        90.0,
     "wrist_3_joint":         0.0,
 }
@@ -75,7 +80,8 @@ ZONE_POSES = [
      "elbow_joint": -60.0, "wrist_1_joint": -75.0, "wrist_2_joint": 90.0, "wrist_3_joint": 0.0},
 ]
 
-MARKER_XY     = [(-0.8, 2.0), (0.8, 2.0), (0.8, 3.0), (-0.8, 3.0)]
+# MARKER_XY     = [(-0.8, 2.0), (0.8, 2.0), (0.8, 3.0), (-0.8, 3.0)]
+MARKER_XY     = [(-0.2, 1.0), (-0.2, 1.0),(-0.2, 1.0),(-0.2, 1.0)]
 ZONE_BOUNDARY = 0.08
 ZONE_CONFIRM  = 3
 ZONE_TIMEOUT  = 3.0
@@ -173,18 +179,41 @@ class JackalUR10UnderwaterDemo:
         print("  ✓ 용접 토치 장착")
 
     def _create_crack_markers(self, stage):
-        S, T, CZ = 0.35, 0.025, 0.25
-        color = Gf.Vec3f(1.0, 0.15, 0.15)
-        bars = [(0, S/2, S, T), (0, -S/2, S, T), (-S/2, 0, T, S), (S/2, 0, T, S)]
+        S, T, CZ = 0.2, 0.025, 1.24
+        color = Gf.Vec3f(0.0, 1.0, 0.0)
+        # color = Gf.Vec3f(1.0, 0.15, 0.15)
+        black_color = Gf.Vec3f(0.0, 0.0, 0.0)
+        margin = 0.3
+
+        # bars = [(0, S/2, S, T), (0, -S/2, S, T), (-S/2, 0, T, S), (S/2, 0, T, S)]
+        # for i, (cx, cy) in enumerate(MARKER_XY):
+        #     for j, (dx, dz, sx, sz) in enumerate(bars):
+        #         path = f'/World/CrackMarker_{i}_bar{j}'
+        #         box = UsdGeom.Cube.Define(stage, path)
+        #         box.GetSizeAttr().Set(1.0)
+        #         xf = UsdGeom.Xformable(stage.GetPrimAtPath(path))
+        #         xf.AddTranslateOp().Set(Gf.Vec3d(cx+dx, cy, CZ+dz))
+        #         xf.AddScaleOp().Set(Gf.Vec3d(sx, T, sz))
+        #         box.GetDisplayColorAttr().Set([color])
+
         for i, (cx, cy) in enumerate(MARKER_XY):
-            for j, (dx, dz, sx, sz) in enumerate(bars):
-                path = f'/World/CrackMarker_{i}_bar{j}'
-                box = UsdGeom.Cube.Define(stage, path)
-                box.GetSizeAttr().Set(1.0)
-                xf = UsdGeom.Xformable(stage.GetPrimAtPath(path))
-                xf.AddTranslateOp().Set(Gf.Vec3d(cx+dx, cy, CZ+dz))
-                xf.AddScaleOp().Set(Gf.Vec3d(sx, T, sz))
-                box.GetDisplayColorAttr().Set([color])
+            # margin = 0.03
+            path_bg = f'/World/CrackMarker_{i}_bg'
+            bg = UsdGeom.Cube.Define(stage, path_bg)
+            bg.GetSizeAttr().Set(1.0)
+            xf = UsdGeom.Xformable(stage.GetPrimAtPath(path_bg))
+            xf.AddTranslateOp().Set(Gf.Vec3d(cx, cy + T, CZ))
+            xf.AddScaleOp().Set(Gf.Vec3d(S + margin, T, S + margin))
+            bg.GetDisplayColorAttr().Set([black_color])
+
+            path = f'/World/CrackMarker_{i}'
+            box = UsdGeom.Cube.Define(stage, path)
+            box.GetSizeAttr().Set(1.0)
+            xf = UsdGeom.Xformable(stage.GetPrimAtPath(path))
+            xf.AddTranslateOp().Set(Gf.Vec3d(cx, cy, CZ))
+            xf.AddScaleOp().Set(Gf.Vec3d(S, T, S))   # x=S, y=얇음, z=S
+            box.GetDisplayColorAttr().Set([color])
+    
         print("  ✓ 균열 마커 4개 (빨간 프레임)")
 
     def _create_weld_path(self, stage):
