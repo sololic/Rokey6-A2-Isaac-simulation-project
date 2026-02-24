@@ -33,7 +33,6 @@ import omni.usd
 from pxr import UsdGeom, Gf, UsdPhysics
 from omni.isaac.core import World
 from omni.isaac.core.articulations import Articulation
-from omni.isaac.core.utils.types import ArticulationAction
 from omni.isaac.core.prims import XFormPrim
 
 import rclpy
@@ -69,10 +68,11 @@ UR10_JOINT_NAMES = [
 ]
 
 # IK 파라미터
-IK_GAIN     = 0.4    # 수렴 속도 (0.1~1.0)
-IK_MAX_STEP = 0.06   # 스텝당 최대 관절 변화 [rad] (~3.4°)
-IK_TOL      = 0.01   # 수렴 허용 거리 [m]
-UR10_SCALE  = 0.5    # USD 파일에서 UR10이 0.5배 스케일
+IK_GAIN        = 0.4    # 수렴 속도 (0.1~1.0)
+IK_MAX_STEP    = 0.06   # 스텝당 최대 관절 변화 [rad] (~3.4°)
+IK_TOL         = 0.01   # 수렴 허용 거리 [m]
+EE_STANDOFF_M  = 0.10   # 마커 표면에서 ee_link를 멈출 거리 [m] (뚫림 방지)
+UR10_SCALE     = 0.5    # USD 파일에서 UR10이 0.5배 스케일
 
 # ─── UR10 DH 파라미터 (표준 UR10, UR10_SCALE 적용) ──────────────────────────
 # 출처: Universal Robots UR10 스펙 (d1=127.3mm, a2=612mm, a3=572.3mm, ...)
@@ -133,20 +133,28 @@ class ToolTargetSubscriber(Node):
     def __init__(self):
         super().__init__('tool_target_controller')
         self._target_pos: np.ndarray | None = None
+        self._locked: bool = False   # True이면 이동 중 → 새 목표 무시
         self.create_subscription(PoseStamped, '/tool_target_pose', self._cb, 10)
         self.get_logger().info('/tool_target_pose 구독 시작')
 
     def _cb(self, msg: PoseStamped):
+        if self._locked:
+            return  # 이동 중: 새 목표 무시
         self._target_pos = np.array([
             msg.pose.position.x,
             msg.pose.position.y,
             msg.pose.position.z,
         ])
+        self._locked = True          # 목표 수신 즉시 잠금
         self.get_logger().info(
             f'새 목표: x={msg.pose.position.x:.3f} '
             f'y={msg.pose.position.y:.3f} '
             f'z={msg.pose.position.z:.3f}'
         )
+
+    def unlock(self):
+        """목표 도달 후 호출 → 다음 목표 수신 허용"""
+        self._locked = False
 
     @property
     def target(self) -> np.ndarray | None:
@@ -180,9 +188,9 @@ class ArmIKController:
         else:
             print(f"[ArmIK] ✓ UR10 DOF 인덱스: {self._arm_idx}")
 
-        # UR10 관절 position drive 명시적 설정
+        # UR10 관절 DriveAPI 저장 + position drive 명시적 설정
         stage = omni.usd.get_context().get_stage()
-        drive_count = 0
+        self._drives: dict[str, object] = {}   # jname → DriveAPI
         for prim in stage.Traverse():
             ppath = str(prim.GetPath())
             for jname in UR10_JOINT_NAMES:
@@ -193,9 +201,23 @@ class ArmIKController:
                     drive.GetStiffnessAttr().Set(10000.0)
                     drive.GetDampingAttr().Set(500.0)
                     drive.GetMaxForceAttr().Set(100000.0)
-                    drive_count += 1
+                    self._drives[jname] = drive
                     break
-        print(f"[ArmIK] ✓ Position DriveAPI 설정: {drive_count}/6 관절")
+        print(f"[ArmIK] ✓ Position DriveAPI 설정: {len(self._drives)}/6 관절")
+
+        # ── 경험적 Jacobian 보정 상태 ──────────────────────────────────────
+        self._J_emp:      np.ndarray | None = None   # 완성되면 세팅
+        self._J_building: np.ndarray        = np.zeros((3, 6))
+        self._cal_q0:     np.ndarray | None = None
+        self._cal_ee0:    np.ndarray | None = None
+        self._cal_i:      int               = 0      # 현재 관절 인덱스 (0~5)
+        self._cal_phase:  int               = 0      # 0=섭동적용 1=대기(perturbed) 2=측정+복원 3=대기(restored)
+        self._cal_wait:   int               = 0
+        self._CAL_EPS    = np.deg2rad(8.0)   # 섭동 크기 [rad]
+        self._CAL_WAIT   = 8                # 물리 수렴 대기 프레임
+        self._settle_wait = 80              # REACH_POSE 도달 대기 프레임 (보정 전)
+
+        self.count = 0
 
     # ── 내부 헬퍼 ─────────────────────────────────────────────────────────
     def _arm_q(self) -> np.ndarray:
@@ -206,42 +228,111 @@ class ArmIKController:
         return np.array(pos[:3], dtype=float)
 
     def _apply(self, q_arm: np.ndarray):
-        all_pos = self._robot.get_joint_positions().copy()
-        for i, idx in enumerate(self._arm_idx):
-            all_pos[idx] = q_arm[i]
-        self._robot.apply_action(ArticulationAction(joint_positions=all_pos))
+        # DriveAPI targetPosition 직접 설정 (degree)
+        for i, jname in enumerate(UR10_JOINT_NAMES):
+            if jname in self._drives:
+                deg = float(np.degrees(q_arm[i]))
+                self._drives[jname].GetTargetPositionAttr().Set(deg)
+
+    # ── 경험적 Jacobian 보정 ───────────────────────────────────────────────
+    def _calibrate(self) -> bool:
+        """
+        경험적 Jacobian을 계산한다.
+        보정 중이면 True 반환 (IK 실행 금지), 완료 후 False 반환.
+        """
+        if self._J_emp is not None:
+            return False   # 이미 완료
+
+        # REACH_POSE 도달 대기
+        if self._settle_wait > 0:
+            self._settle_wait -= 1
+            if self._settle_wait == 0:
+                print("[Cal] REACH_POSE 안정화 완료 → 보정 시작")
+            return True
+
+        if self._cal_i >= 6:
+            self._J_emp = self._J_building.copy()
+            print("[Cal] ✓ 경험적 Jacobian 완성")
+            print(f"[Cal] J =\n{self._J_emp.round(4)}")
+            return False
+
+        if self._cal_phase == 0:
+            # 현재 상태 저장 + 섭동 적용
+            self._cal_q0  = self._arm_q().copy()
+            self._cal_ee0 = self._ee_pos().copy()
+            q_pert = self._cal_q0.copy()
+            q_pert[self._cal_i] += self._CAL_EPS
+            self._apply(q_pert)
+            self._cal_wait = 0
+            self._cal_phase = 1
+
+        elif self._cal_phase == 1:
+            # 섭동 후 물리 수렴 대기
+            self._cal_wait += 1
+            if self._cal_wait >= self._CAL_WAIT:
+                self._cal_phase = 2
+
+        elif self._cal_phase == 2:
+            # EE 변위 측정 → J 열 기록 → 관절 복원
+            ee_pert = self._ee_pos()
+            dee = ee_pert - self._cal_ee0
+            self._J_building[:, self._cal_i] = dee / self._CAL_EPS
+            print(f"[Cal] joint {self._cal_i} ({UR10_JOINT_NAMES[self._cal_i]}): "
+                  f"dee={dee.round(4)}")
+            self._apply(self._cal_q0)
+            self._cal_wait = 0
+            self._cal_phase = 3
+
+        elif self._cal_phase == 3:
+            # 복원 후 물리 수렴 대기 → 다음 관절
+            self._cal_wait += 1
+            if self._cal_wait >= self._CAL_WAIT:
+                self._cal_i += 1
+                self._cal_phase = 0
+
+        return True   # 아직 보정 중
 
     # ── 메인 업데이트 ──────────────────────────────────────────────────────
     def update(self):
         """매 시뮬레이션 스텝에서 호출"""
         # 1. ROS2 메시지 처리 (논블로킹)
         rclpy.spin_once(self._ros, timeout_sec=0)
+        # 2. 경험적 Jacobian 보정 (완료되기 전에는 IK 실행 안 함)
+        if self._calibrate():
+            return
 
         target = self._ros.target
         if target is None:
             return
+        self.count += 1
+        # 3. 현재 상태 읽기
+        q      = self._arm_q()
+        ee_pos = self._ee_pos()
 
-        # 2. 현재 상태 읽기
-        q       = self._arm_q()
-        ee_pos  = self._ee_pos()
-        T_base  = xform_to_mat4(self._base)
+        # 4. 접근 방향 기반 standoff 적용 (마커 표면 뚫림 방지)
+        #    UR10 베이스 → 타겟 수평 벡터로 접근 방향 계산
+        base_pos   = np.array(self._base.get_world_pose()[0][:3], dtype=float)
+        horiz      = target - base_pos
+        horiz[2]   = 0.0
+        horiz_norm = np.linalg.norm(horiz)
+        approach_dir = horiz / horiz_norm if horiz_norm > 1e-3 else np.array([0.0, 1.0, 0.0])
+        effective_target = target - EE_STANDOFF_M * approach_dir
 
-        # 3. 오차 계산
-        error    = target - ee_pos
+        # 5. 오차 계산
+        error    = effective_target - ee_pos
         err_norm = float(np.linalg.norm(error))
-
-        # 디버그: 항상 출력 (수렴 후 억제)
-        print(f"[ArmIK] err={err_norm:.4f}m  ee={ee_pos.round(3)}  target={target.round(3)}")
+        if self.count > 10:
+            print(f"[ArmIK] err={err_norm:.4f}m  ee={ee_pos.round(3)}  eff_target={effective_target.round(3)}")
+            self.count = 0
 
         if err_norm < IK_TOL:
-            return  # 목표 도달
+            self._ros.unlock()   # 목표 도달 → 다음 목표 수신 허용
+            return
 
-        # 4. Jacobian Transpose IK 한 스텝
-        J  = position_jacobian(q, T_base)
+        # 5. Jacobian Transpose IK 한 스텝 (경험적 J 사용)
+        J  = self._J_emp
         dq = IK_GAIN * (J.T @ error)
         dq = np.clip(dq, -IK_MAX_STEP, IK_MAX_STEP)
-
-        # 5. 적용
         self._apply(q + dq)
 
 
@@ -320,17 +411,15 @@ def main():
     robot.set_joint_positions(init_pos)
     print("[Main] ✓ 홈 자세 설정 완료 (0,0,0,0,0,0)")
 
-    # REACH 자세로 이동
-    reach_pos = init_pos.copy()
-    for jname, deg in REACH_POSE_DEG.items():
-        for i, n in enumerate(dof_names):
-            if n == jname:
-                reach_pos[i] = np.deg2rad(deg)
-    robot.apply_action(ArticulationAction(joint_positions=reach_pos))
-    print("[Main] ✓ REACH_POSE 적용")
-
-    # IK 제어기 생성
+    # IK 제어기 생성 (DriveAPI 설정 포함)
     controller = ArmIKController(robot, ros_node)
+
+    # REACH 자세로 이동 (DriveAPI 경유 → 실제로 작동)
+    reach_q = np.zeros(6)
+    for i, jname in enumerate(UR10_JOINT_NAMES):
+        reach_q[i] = np.deg2rad(REACH_POSE_DEG.get(jname, 0.0))
+    controller._apply(reach_q)
+    print("[Main] ✓ REACH_POSE DriveAPI 적용 (80프레임 안정화 대기 중...)")
 
     print("\n[Main] 시뮬레이션 실행 중. 다른 터미널에서 목표 발행:")
     print("  ros2 topic pub /tool_target_pose geometry_msgs/msg/PoseStamped \\")
