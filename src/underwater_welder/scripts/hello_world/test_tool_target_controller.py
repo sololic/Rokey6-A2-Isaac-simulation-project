@@ -12,23 +12,49 @@ test_tool_target_controller.py
       '{header: {frame_id: World}, pose: {position: {x: 1.0, y: 0.5, z: 1.0}}}' --once
 """
 
+# ── Python 3.11용 ROS2 패키지 경로 추가 (SimulationApp 보다 반드시 먼저) ──────
+import sys
+_ROS2_PY311 = "/home/rokey/isaacsim/exts/isaacsim.ros2.bridge/humble/rclpy"
+if _ROS2_PY311 not in sys.path:
+    sys.path.insert(0, _ROS2_PY311)
+# ────────────────────────────────────────────────────────────────────────────
+
 # ── Isaac Sim 반드시 먼저 시작 ──────────────────────────────────────────────
 from isaacsim import SimulationApp
-simulation_app = SimulationApp({"headless": False, "width": 1280, "height": 720})
+simulation_app = SimulationApp({
+    "headless": False,
+    "width": 1280,
+    "height": 720,
+    "extra_args": ["--enable", "omni.isaac.ros2_bridge"],
+})
 
 import numpy as np
-import rclpy
-from rclpy.node import Node
-from geometry_msgs.msg import PoseStamped
-
 import omni.usd
+from pxr import UsdGeom, Gf, UsdPhysics
 from omni.isaac.core import World
 from omni.isaac.core.articulations import Articulation
 from omni.isaac.core.utils.types import ArticulationAction
 from omni.isaac.core.prims import XFormPrim
 
+import rclpy
+from rclpy.node import Node
+from geometry_msgs.msg import PoseStamped
+
+# ─── 균열 마커 상수 ─────────────────────────────────────────────────────────
+MARKER_XY = [(-0.2, 1.0)]   # 마커 1개만 생성
+
+# ─── REACH 자세 (홈 → 이 자세로 이동) ─────────────────────────────────────
+REACH_POSE_DEG = {
+    "shoulder_pan_joint":   90.0,
+    "shoulder_lift_joint": -90.0,
+    "elbow_joint":          90.0,
+    "wrist_1_joint":         0.0,
+    "wrist_2_joint":         90.0,
+    "wrist_3_joint":          0.0,
+}
+
 # ─── 설정 상수 ──────────────────────────────────────────────────────────────
-USD_PATH       = "/home/rokey/Downloads/jackal_and_ur10.usd"
+USD_PATH       = "/home/rokey/hamtaro/src/underwater_welder/jackal_and_ur10_2.usd"
 ROBOT_PATH     = "/jackal"
 EE_PRIM_PATH   = "/jackal/ur10/ee_link"
 UR10_BASE_PATH = "/jackal/ur10"
@@ -150,8 +176,26 @@ class ArmIKController:
 
         if len(self._arm_idx) != 6:
             print(f"[ArmIK] ⚠ {len(self._arm_idx)}/6 관절만 찾음 – DOF 이름 확인 필요")
+            print(f"[ArmIK]   전체 DOF: {list(dof_names)}")
         else:
             print(f"[ArmIK] ✓ UR10 DOF 인덱스: {self._arm_idx}")
+
+        # UR10 관절 position drive 명시적 설정
+        stage = omni.usd.get_context().get_stage()
+        drive_count = 0
+        for prim in stage.Traverse():
+            ppath = str(prim.GetPath())
+            for jname in UR10_JOINT_NAMES:
+                if ppath.endswith(jname):
+                    drive = UsdPhysics.DriveAPI.Get(prim, "angular")
+                    if not drive:
+                        drive = UsdPhysics.DriveAPI.Apply(prim, "angular")
+                    drive.GetStiffnessAttr().Set(10000.0)
+                    drive.GetDampingAttr().Set(500.0)
+                    drive.GetMaxForceAttr().Set(100000.0)
+                    drive_count += 1
+                    break
+        print(f"[ArmIK] ✓ Position DriveAPI 설정: {drive_count}/6 관절")
 
     # ── 내부 헬퍼 ─────────────────────────────────────────────────────────
     def _arm_q(self) -> np.ndarray:
@@ -186,6 +230,9 @@ class ArmIKController:
         error    = target - ee_pos
         err_norm = float(np.linalg.norm(error))
 
+        # 디버그: 항상 출력 (수렴 후 억제)
+        print(f"[ArmIK] err={err_norm:.4f}m  ee={ee_pos.round(3)}  target={target.round(3)}")
+
         if err_norm < IK_TOL:
             return  # 목표 도달
 
@@ -197,9 +244,33 @@ class ArmIKController:
         # 5. 적용
         self._apply(q + dq)
 
-        if err_norm > 0.05:
-            print(f"[ArmIK] err={err_norm:.3f}m  "
-                  f"ee={ee_pos.round(3)}  target={target.round(3)}")
+
+# ─── 균열 마커 생성 ──────────────────────────────────────────────────────────
+def create_crack_markers():
+    stage = omni.usd.get_context().get_stage()
+    S, T, CZ = 0.2, 0.025, 1.24
+    color       = Gf.Vec3f(0.0, 1.0, 0.0)
+    black_color = Gf.Vec3f(0.0, 0.0, 0.0)
+    margin = 0.3
+
+    for i, (cx, cy) in enumerate(MARKER_XY):
+        path_bg = f'/World/CrackMarker_{i}_bg'
+        bg = UsdGeom.Cube.Define(stage, path_bg)
+        bg.GetSizeAttr().Set(1.0)
+        xf = UsdGeom.Xformable(stage.GetPrimAtPath(path_bg))
+        xf.AddTranslateOp().Set(Gf.Vec3d(cx, cy + T, CZ))
+        xf.AddScaleOp().Set(Gf.Vec3d(S + margin, T, S + margin))
+        bg.GetDisplayColorAttr().Set([black_color])
+
+        path = f'/World/CrackMarker_{i}'
+        box = UsdGeom.Cube.Define(stage, path)
+        box.GetSizeAttr().Set(1.0)
+        xf = UsdGeom.Xformable(stage.GetPrimAtPath(path))
+        xf.AddTranslateOp().Set(Gf.Vec3d(cx, cy, CZ))
+        xf.AddScaleOp().Set(Gf.Vec3d(S, T, S))
+        box.GetDisplayColorAttr().Set([color])
+
+    print(f"[Marker] 균열 마커 {len(MARKER_XY)}개 생성")
 
 
 # ─── Isaac Sim 메인 루프 ─────────────────────────────────────────────────────
@@ -211,6 +282,9 @@ def main():
 
     # USD 로드
     omni.usd.get_context().open_stage(USD_PATH)
+
+    # 균열 마커 생성
+    create_crack_markers()
 
     # World 생성
     world = World()
@@ -231,7 +305,7 @@ def main():
     # 홈 자세 설정
     home_deg = {
         "shoulder_pan_joint":   0.0,
-        "shoulder_lift_joint": -90.0,
+        "shoulder_lift_joint":  0.0,
         "elbow_joint":          0.0,
         "wrist_1_joint":        0.0,
         "wrist_2_joint":        0.0,
@@ -244,7 +318,16 @@ def main():
             if n == jname:
                 init_pos[i] = np.deg2rad(deg)
     robot.set_joint_positions(init_pos)
-    print("[Main] ✓ 홈 자세 설정 완료")
+    print("[Main] ✓ 홈 자세 설정 완료 (0,0,0,0,0,0)")
+
+    # REACH 자세로 이동
+    reach_pos = init_pos.copy()
+    for jname, deg in REACH_POSE_DEG.items():
+        for i, n in enumerate(dof_names):
+            if n == jname:
+                reach_pos[i] = np.deg2rad(deg)
+    robot.apply_action(ArticulationAction(joint_positions=reach_pos))
+    print("[Main] ✓ REACH_POSE 적용")
 
     # IK 제어기 생성
     controller = ArmIKController(robot, ros_node)
