@@ -28,9 +28,13 @@ simulation_app = SimulationApp({
     "extra_args": ["--enable", "omni.isaac.ros2_bridge"],
 })
 
+import math
+import random
+from enum import Enum, auto
+
 import numpy as np
 import omni.usd
-from pxr import UsdGeom, Gf, UsdPhysics
+from pxr import UsdGeom, Gf, UsdPhysics, UsdLux
 from omni.isaac.core import World
 from omni.isaac.core.articulations import Articulation
 from omni.isaac.core.prims import XFormPrim
@@ -38,9 +42,63 @@ from omni.isaac.core.prims import XFormPrim
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped
+from std_msgs.msg import Empty
 
-# ─── 균열 마커 상수 ─────────────────────────────────────────────────────────
-MARKER_XY = [(-0.2, 1.0)]   # 마커 1개만 생성
+# ─── 용접 판 / 마커 상수 ────────────────────────────────────────────────────
+WELD_TRIGGER_DIST    = 0.04   # 용접 트리거 거리 [m]
+
+# ── 용접 대기 시간 (프레임 단위, 60fps 기준 1프레임≈16ms) ──────────────────────
+WELD_HEAT_STEPS      = 30/50    # ← 변경 가능: 가열 대기 (30f ≈ 0.5초)
+WELD_ACTIVE_STEPS    = 20/50   # ← 변경 가능: 용접 활성 (20f ≈ 0.3초)
+WELD_COOLDOWN_STEPS  = 15/50    # ← 변경 가능: 냉각 대기 (15f ≈ 0.25초)
+# 한 점당 총 대기 = HEAT + ACTIVE + COOLDOWN = 65f ≈ 1.1초
+# ────────────────────────────────────────────────────────────────────────────
+
+# ── 변당 웨이포인트 수 (green_marker_pnp_node.py의 WAYPOINTS_PER_EDGE와 동일해야 함) ─
+WELD_WAYPOINTS_PER_EDGE = 80  # ← 변경 시 green_marker_pnp_node.py도 같이 수정
+# 한 사이클 총 용접 점 수 = WELD_WAYPOINTS_PER_EDGE × 4
+# ────────────────────────────────────────────────────────────────────────────
+
+BEAD_POOL_RADIUS     = 0.015
+BEAD_HEIGHT          = 0.003
+BEAD_COLOR           = Gf.Vec3f(0.78, 0.78, 0.82)
+
+SPARK_BATCH_SIZE     = 4
+SPARK_MAX_ALIVE      = 6
+SPARK_INTENSITY_PEAK = 50000000.0
+SPARK_RADIUS_LIGHT   = 0.003
+SPARK_COLOR          = Gf.Vec3f(0.4, 0.6, 1.0)
+SPARK_LIFETIME_STEPS = 8
+SPARK_JITTER         = 0.008
+SPARK_GAP_RATIO      = 0.95
+
+BUBBLE_COUNT          = 3
+BUBBLE_RADIUS         = 0.008
+BUBBLE_COLOR          = Gf.Vec3f(0.82, 0.92, 1.0)
+BUBBLE_RISE_SPEED     = 0.05
+BUBBLE_LIFETIME_STEPS = 60
+
+PLATE_PATH       = "/World/WeldPlate"
+PLATE_SIZE_X     = 0.5
+PLATE_SIZE_Z     = 0.5
+PLATE_THICKNESS  = 0.025
+PLATE_MASS       = 60.0
+PLATE_COLOR      = Gf.Vec3f(0.0, 0.0, 0.0)
+
+MARKER_PATH      = PLATE_PATH + "/GreenMarker"
+MARKER_SIZE      = 0.2
+MARKER_THICKNESS = 0.001
+MARKER_COLOR     = Gf.Vec3f(0.0, 1.0, 0.0)
+
+# 마커 위치: (x=-0.2, y=1.0, z=1.24)  ← MARKER_XY와 동일
+PLATE_POS      = np.array([-0.2, 1.0, 1.24])
+PLATE_FRONT_Y  = float(PLATE_POS[1]) - PLATE_THICKNESS / 2.0   # 로봇이 접근하는 면
+
+# 용접봉 (ee_link 자식 prim → 팔과 같이 움직임)
+ELECTRODE_PRIM_PATH = "/jackal/ur10/ee_link/WeldRod"
+ELECTRODE_TIP_PATH  = "/jackal/ur10/ee_link/WeldRod/Tip"
+ELECTRODE_RADIUS    = 0.004   # 봉 반지름 [m]
+ELECTRODE_HEIGHT    = 0.08    # 봉 길이 [m] (ee_link local-x 방향으로 뻗음)
 
 # ─── REACH 자세 (홈 → 이 자세로 이동) ─────────────────────────────────────
 REACH_POSE_DEG = {
@@ -68,11 +126,11 @@ UR10_JOINT_NAMES = [
 ]
 
 # IK 파라미터
-IK_GAIN        = 0.4    # 수렴 속도 (0.1~1.0)
-IK_MAX_STEP    = 0.06   # 스텝당 최대 관절 변화 [rad] (~3.4°)
-IK_TOL         = 0.01   # 수렴 허용 거리 [m]
-EE_STANDOFF_M  = 0.10   # 마커 표면에서 ee_link를 멈출 거리 [m] (뚫림 방지)
-UR10_SCALE     = 0.5    # USD 파일에서 UR10이 0.5배 스케일
+IK_GAIN     = 0.5    # 수렴 속도 (0.1~1.0)
+IK_MAX_STEP = 0.03   # 스텝당 최대 관절 변화 [rad] (~3.4°)
+IK_TOL      = 0.003   # 수렴 허용 거리 [m]
+UR10_SCALE  = 0.5    # USD 파일에서 UR10이 0.5배 스케일
+# standoff = ELECTRODE_HEIGHT + WELD_TRIGGER_DIST*0.8 (update()에서 동적 계산)
 
 # ─── UR10 DH 파라미터 (표준 UR10, UR10_SCALE 적용) ──────────────────────────
 # 출처: Universal Robots UR10 스펙 (d1=127.3mm, a2=612mm, a3=572.3mm, ...)
@@ -113,6 +171,16 @@ def position_jacobian(q: np.ndarray, T_wb: np.ndarray) -> np.ndarray:
     return J
 
 
+def rotation_matrix_from_quaternion(quat: np.ndarray) -> np.ndarray:
+    """쿼터니언 [w,x,y,z] → 3×3 회전 행렬"""
+    w, x, y, z = quat
+    return np.array([
+        [1-2*(y*y+z*z),   2*(x*y-w*z),   2*(x*z+w*y)],
+        [  2*(x*y+w*z), 1-2*(x*x+z*z),   2*(y*z-w*x)],
+        [  2*(x*z-w*y),   2*(y*z+w*x), 1-2*(x*x+y*y)],
+    ])
+
+
 def xform_to_mat4(prim: XFormPrim) -> np.ndarray:
     """Isaac Sim XFormPrim → 4×4 변환 행렬 (column-vector convention)"""
     pos, quat = prim.get_world_pose()   # quat = [w, x, y, z]
@@ -134,7 +202,10 @@ class ToolTargetSubscriber(Node):
         super().__init__('tool_target_controller')
         self._target_pos: np.ndarray | None = None
         self._locked: bool = False   # True이면 이동 중 → 새 목표 무시
+        self.corner_count: int = 0   # 완료된 코너 수 (0~4)
         self.create_subscription(PoseStamped, '/tool_target_pose', self._cb, 10)
+        self._corner_ack_pub      = self.create_publisher(Empty, '/corner_ack',      10)
+        self._weld_cycle_done_pub = self.create_publisher(Empty, '/weld_cycle_done', 10)
         self.get_logger().info('/tool_target_pose 구독 시작')
 
     def _cb(self, msg: PoseStamped):
@@ -153,8 +224,15 @@ class ToolTargetSubscriber(Node):
         )
 
     def unlock(self):
-        """목표 도달 후 호출 → 다음 목표 수신 허용"""
+        """다음 목표 수신 허용 (이전 목표 삭제 → 새 목표 올 때까지 IK 대기)"""
+        self._target_pos = None
         self._locked = False
+
+    def publish_corner_ack(self):
+        self._corner_ack_pub.publish(Empty())
+
+    def publish_weld_cycle_done(self):
+        self._weld_cycle_done_pub.publish(Empty())
 
     @property
     def target(self) -> np.ndarray | None:
@@ -216,6 +294,9 @@ class ArmIKController:
         self._CAL_EPS    = np.deg2rad(8.0)   # 섭동 크기 [rad]
         self._CAL_WAIT   = 8                # 물리 수렴 대기 프레임
         self._settle_wait = 80              # REACH_POSE 도달 대기 프레임 (보정 전)
+
+        self._at_target: bool = False   # 목표 도달 플래그 (용접 완료 후 unlock)
+        self._returning: bool = False   # REACH_POSE 복귀 중 플래그
 
         self.count = 0
 
@@ -300,25 +381,26 @@ class ArmIKController:
         # 2. 경험적 Jacobian 보정 (완료되기 전에는 IK 실행 안 함)
         if self._calibrate():
             return
+        # 3. 복귀 중에는 IK 실행 안 함 (DriveAPI로 REACH_POSE 유지)
+        if self._returning:
+            return
 
         target = self._ros.target
         if target is None:
             return
         self.count += 1
-        # 3. 현재 상태 읽기
+        # 4. 현재 상태 읽기
         q      = self._arm_q()
         ee_pos = self._ee_pos()
 
-        # 4. 접근 방향 기반 standoff 적용 (마커 표면 뚫림 방지)
-        #    UR10 베이스 → 타겟 수평 벡터로 접근 방향 계산
-        base_pos   = np.array(self._base.get_world_pose()[0][:3], dtype=float)
-        horiz      = target - base_pos
-        horiz[2]   = 0.0
-        horiz_norm = np.linalg.norm(horiz)
-        approach_dir = horiz / horiz_norm if horiz_norm > 1e-3 else np.array([0.0, 1.0, 0.0])
-        effective_target = target - EE_STANDOFF_M * approach_dir
+        # 5. 용접봉 방향(elec_dir) 기반 standoff (봉 끝이 마커를 뚫지 않도록)
+        _, quat_ee   = self._ee.get_world_pose()
+        R_ee         = rotation_matrix_from_quaternion(np.array(quat_ee))
+        elec_dir     = R_ee @ np.array([1.0, 0.0, 0.0])   # ee_link local-x → world
+        standoff_dist    = ELECTRODE_HEIGHT + WELD_TRIGGER_DIST * 0.8
+        effective_target = target - elec_dir * standoff_dist
 
-        # 5. 오차 계산
+        # 6. 오차 계산
         error    = effective_target - ee_pos
         err_norm = float(np.linalg.norm(error))
         if self.count > 10:
@@ -326,42 +408,281 @@ class ArmIKController:
             self.count = 0
 
         if err_norm < IK_TOL:
-            self._ros.unlock()   # 목표 도달 → 다음 목표 수신 허용
-            return
+            if not self._at_target:
+                self._at_target = True
+                print(f"[ArmIK] 목표 도달 → 용접 완료 대기")
+            return  # unlock은 용접 COOLDOWN→IDLE 후 main에서 처리
 
-        # 5. Jacobian Transpose IK 한 스텝 (경험적 J 사용)
+        # 7. Jacobian Transpose IK 한 스텝 (경험적 J 사용)
         J  = self._J_emp
         dq = IK_GAIN * (J.T @ error)
         dq = np.clip(dq, -IK_MAX_STEP, IK_MAX_STEP)
         self._apply(q + dq)
 
 
-# ─── 균열 마커 생성 ──────────────────────────────────────────────────────────
-def create_crack_markers():
+# ─── 용접봉 생성 (ee_link 자식 → 팔과 같이 움직임) ──────────────────────────
+def spawn_weld_electrode():
     stage = omni.usd.get_context().get_stage()
-    S, T, CZ = 0.2, 0.025, 1.24
-    color       = Gf.Vec3f(0.0, 1.0, 0.0)
-    black_color = Gf.Vec3f(0.0, 0.0, 0.0)
-    margin = 0.3
+    if stage.GetPrimAtPath(ELECTRODE_PRIM_PATH).IsValid():
+        print("[Weld] WeldElectrode already exists, skipping.")
+        return
 
-    for i, (cx, cy) in enumerate(MARKER_XY):
-        path_bg = f'/World/CrackMarker_{i}_bg'
-        bg = UsdGeom.Cube.Define(stage, path_bg)
-        bg.GetSizeAttr().Set(1.0)
-        xf = UsdGeom.Xformable(stage.GetPrimAtPath(path_bg))
-        xf.AddTranslateOp().Set(Gf.Vec3d(cx, cy + T, CZ))
-        xf.AddScaleOp().Set(Gf.Vec3d(S + margin, T, S + margin))
-        bg.GetDisplayColorAttr().Set([black_color])
+    # 봉 몸체 (검은 원기둥)
+    # Cylinder 기본 축 = local-Z. RotateY=90° 하면 → ee_link local-X 방향으로 정렬
+    # 중심을 ee_link local-X의 HEIGHT/2 위치에 놓으면 봉이 0 ~ HEIGHT 범위에 걸침
+    rod = UsdGeom.Cylinder.Define(stage, ELECTRODE_PRIM_PATH)
+    rod.CreateRadiusAttr(ELECTRODE_RADIUS)
+    rod.CreateHeightAttr(ELECTRODE_HEIGHT)
+    rod.CreateDisplayColorAttr([Gf.Vec3f(0.1, 0.1, 0.1)])
+    xf = UsdGeom.Xformable(stage.GetPrimAtPath(ELECTRODE_PRIM_PATH))
+    xf.AddTranslateOp().Set(Gf.Vec3d(ELECTRODE_HEIGHT / 2.0, 0.0, 0.0))
+    xf.AddRotateYOp().Set(90.0)
 
-        path = f'/World/CrackMarker_{i}'
-        box = UsdGeom.Cube.Define(stage, path)
-        box.GetSizeAttr().Set(1.0)
-        xf = UsdGeom.Xformable(stage.GetPrimAtPath(path))
-        xf.AddTranslateOp().Set(Gf.Vec3d(cx, cy, CZ))
-        xf.AddScaleOp().Set(Gf.Vec3d(S, T, S))
-        box.GetDisplayColorAttr().Set([color])
+    # 봉 끝 (주황색 구)
+    # WeldRod 로컬 Z축 = Cylinder 축 = RotateY 전 기준 → Tip은 WeldRod 로컬 +Z 끝에
+    tip = UsdGeom.Sphere.Define(stage, ELECTRODE_TIP_PATH)
+    tip.CreateRadiusAttr(ELECTRODE_RADIUS * 1.8)
+    tip.CreateDisplayColorAttr([Gf.Vec3f(1.0, 0.5, 0.1)])
+    UsdGeom.Xformable(stage.GetPrimAtPath(ELECTRODE_TIP_PATH)).AddTranslateOp().Set(
+        Gf.Vec3d(0.0, 0.0, ELECTRODE_HEIGHT / 2.0))  # WeldRod 로컬 +Z 끝 = 봉 끝
 
-    print(f"[Marker] 균열 마커 {len(MARKER_XY)}개 생성")
+    print(f"[Weld] WeldElectrode spawned  parent={ELECTRODE_PRIM_PATH.rsplit('/', 1)[0]}")
+    print(f"[Weld]   반지름={ELECTRODE_RADIUS*1000:.1f}mm  길이={ELECTRODE_HEIGHT*100:.1f}cm")
+
+
+# ─── 용접 상태 머신 ──────────────────────────────────────────────────────────
+class WeldState(Enum):
+    IDLE     = auto()
+    HEATING  = auto()
+    WELDING  = auto()
+    COOLDOWN = auto()
+
+
+# ─── 용접 판 생성 ─────────────────────────────────────────────────────────────
+def spawn_weld_plate():
+    stage = omni.usd.get_context().get_stage()
+    if stage.GetPrimAtPath(PLATE_PATH).IsValid():
+        print("[Weld] WeldPlate already exists, skipping.")
+        return
+
+    # 검은 배경 판
+    geom = UsdGeom.Cube.Define(stage, PLATE_PATH)
+    geom.CreateDisplayColorAttr([PLATE_COLOR])
+    prim = stage.GetPrimAtPath(PLATE_PATH)
+    xf   = UsdGeom.Xformable(prim)
+    xf.AddTranslateOp().Set(Gf.Vec3d(*PLATE_POS.tolist()))
+    xf.AddScaleOp().Set(Gf.Vec3f(PLATE_SIZE_X/2.0, PLATE_THICKNESS/2.0, PLATE_SIZE_Z/2.0))
+    UsdPhysics.RigidBodyAPI.Apply(prim)
+    UsdPhysics.CollisionAPI.Apply(prim)
+    UsdPhysics.MassAPI.Apply(prim).CreateMassAttr(PLATE_MASS)
+    UsdPhysics.RigidBodyAPI(prim).CreateKinematicEnabledAttr(True)
+
+    # 초록 정사각형 마커 (판 앞면에 부착)
+    marker = UsdGeom.Cube.Define(stage, MARKER_PATH)
+    marker.CreateDisplayColorAttr([MARKER_COLOR])
+    mxf = UsdGeom.Xformable(stage.GetPrimAtPath(MARKER_PATH))
+    sx = (MARKER_SIZE / 2.0) / (PLATE_SIZE_X / 2.0)
+    sz = (MARKER_SIZE / 2.0) / (PLATE_SIZE_Z / 2.0)
+    sy = MARKER_THICKNESS / PLATE_THICKNESS
+    mxf.AddTranslateOp().Set(Gf.Vec3d(0.0, -1.0 - sy, 0.0))  # 앞면(-y)에 부착
+    mxf.AddScaleOp().Set(Gf.Vec3f(sx, sy, sz))
+
+    print(f"[Weld] WeldPlate spawned  pos={PLATE_POS}")
+    print(f"[Weld] GreenMarker spawned  size={MARKER_SIZE}x{MARKER_SIZE}m")
+    print(f"[Weld] PLATE_FRONT_Y={PLATE_FRONT_Y:.4f}")
+
+
+# ─── 용접 시스템 ──────────────────────────────────────────────────────────────
+class WeldingSystem:
+    """
+    UR10 ee_link 위치를 전극으로 사용하는 용접 시스템.
+    ee_link가 PLATE_FRONT_Y에서 WELD_TRIGGER_DIST 이내로 접근하면 용접 시작.
+    """
+
+    def __init__(self, stage, ee_xform: XFormPrim):
+        self._stage          = stage
+        self._ee             = ee_xform        # UR10 ee_link XFormPrim
+        self._state          = WeldState.IDLE
+        self._heat_counter   = 0
+        self._active_counter = 0
+        self._cool_counter   = 0
+        self._bead_idx       = 0
+        self._fx_idx         = 0
+        self._spark_prims    = []
+        self._bubble_prims   = []
+
+    def step(self, at_target: bool = False):
+        self._tick_particles()
+        tip_pos, elec_dir = self._get_tip_and_direction()
+        if tip_pos is None:
+            return
+        dist = self._dist_to_plate(tip_pos)
+
+        if self._state == WeldState.IDLE:
+            if dist <= WELD_TRIGGER_DIST and at_target:
+                self._state        = WeldState.HEATING
+                self._heat_counter = 1
+                print(f"[Weld] IDLE → HEATING  dist={dist*100:.1f}cm")
+
+        elif self._state == WeldState.HEATING:
+            if dist <= WELD_TRIGGER_DIST:
+                self._heat_counter += 1
+                if self._heat_counter >= WELD_HEAT_STEPS:
+                    self._state          = WeldState.WELDING
+                    self._active_counter = 0
+                    print("[Weld] HEATING → WELDING")
+            else:
+                self._state = WeldState.IDLE
+                print("[Weld] HEATING 취소 → IDLE")
+
+        elif self._state == WeldState.WELDING:
+            self._active_counter += 1
+            if self._active_counter == 1:
+                self._spawn_weld_bead(tip_pos, elec_dir)
+            self._spawn_sparks(tip_pos)
+            if self._active_counter >= WELD_ACTIVE_STEPS:
+                self._state        = WeldState.COOLDOWN
+                self._cool_counter = 0
+                self._spawn_bubbles(tip_pos)
+                print("[Weld] WELDING → COOLDOWN")
+
+        elif self._state == WeldState.COOLDOWN:
+            self._cool_counter += 1
+            if self._cool_counter >= WELD_COOLDOWN_STEPS:
+                self._state = WeldState.IDLE
+                print("[Weld] COOLDOWN → IDLE")
+
+    def _get_tip_and_direction(self):
+        try:
+            pos, quat = self._ee.get_world_pose()
+            ee_pos   = np.array(pos[:3], dtype=float)
+            R        = rotation_matrix_from_quaternion(np.array(quat))
+            elec_dir = R @ np.array([1.0, 0.0, 0.0])   # ee_link local-x → world
+            # 실제 용접봉 끝 = ee_link 중심 + 봉 길이만큼 앞
+            tip_pos  = ee_pos + elec_dir * ELECTRODE_HEIGHT
+            return tip_pos, elec_dir
+        except Exception as e:
+            print(f"[Weld] tip 계산 실패: {e}")
+            return None, None
+
+    def _dist_to_plate(self, tip_pos: np.ndarray) -> float:
+        cx, cy, cz = PLATE_POS
+        closest = np.array([
+            np.clip(tip_pos[0], cx - PLATE_SIZE_X   / 2.0, cx + PLATE_SIZE_X   / 2.0),
+            np.clip(tip_pos[1], cy - PLATE_THICKNESS / 2.0, cy + PLATE_THICKNESS / 2.0),
+            np.clip(tip_pos[2], cz - PLATE_SIZE_Z   / 2.0, cz + PLATE_SIZE_Z   / 2.0),
+        ])
+        return float(np.linalg.norm(tip_pos - closest))
+
+    def _spawn_weld_bead(self, tip_pos: np.ndarray, electrode_dir: np.ndarray):
+        path = f"/World/WeldBeads/Bead_{self._bead_idx:04d}"
+        self._bead_idx += 1
+        bead_pos    = tip_pos.copy()
+        bead_pos[1] = PLATE_FRONT_Y - BEAD_HEIGHT * 0.5
+        plate_normal = np.array([0.0, 1.0, 0.0])
+        cos_theta    = np.clip(np.dot(electrode_dir, plate_normal), -1.0, 1.0)
+        angle_rad    = math.acos(abs(cos_theta))
+        angle_ratio  = angle_rad / (math.pi / 2.0)
+        dir_on_plate = electrode_dir - cos_theta * plate_normal
+        dir_len      = np.linalg.norm(dir_on_plate)
+        dist_ratio   = np.clip(self._dist_to_plate(tip_pos) / WELD_TRIGGER_DIST, 0.0, 1.0)
+        dist_scale   = 0.3 + (1.2 - 0.3) * (1.0 - dist_ratio)
+        sx = BEAD_POOL_RADIUS * dist_scale
+        sy = BEAD_HEIGHT * dist_scale * (1.0 - 0.6 * angle_ratio)
+        sz = BEAD_POOL_RADIUS * dist_scale
+        stretch = 1.0 + 2.5 * angle_ratio
+        if dir_len > 1e-4:
+            d  = dir_on_plate / dir_len
+            sx *= 1.0 + (stretch - 1.0) * abs(d[0])
+            sz *= 1.0 + (stretch - 1.0) * abs(d[2])
+        if not self._stage.GetPrimAtPath(path).IsValid():
+            sphere = UsdGeom.Sphere.Define(self._stage, path)
+            sphere.CreateRadiusAttr(1.0)
+            sphere.CreateDisplayColorAttr([BEAD_COLOR])
+            xf = UsdGeom.Xformable(self._stage.GetPrimAtPath(path))
+            xf.AddTranslateOp().Set(Gf.Vec3d(*bead_pos.tolist()))
+            xf.AddScaleOp().Set(Gf.Vec3f(sx, sy, sz))
+            print(f"[Weld] 비드 생성: {path}")
+
+    def _spawn_sparks(self, origin: np.ndarray):
+        plate_contact = origin.copy()
+        plate_contact[1] = PLATE_FRONT_Y
+        spark_origin = plate_contact + (origin - plate_contact) * SPARK_GAP_RATIO
+        if len(self._spark_prims) >= SPARK_MAX_ALIVE:
+            return
+        spawn_n  = min(SPARK_BATCH_SIZE, SPARK_MAX_ALIVE - len(self._spark_prims))
+        base_idx = self._fx_idx
+        self._fx_idx += 1
+        for i in range(spawn_n):
+            path = f"/World/WeldFX/Spark_{base_idx:04d}_{i}"
+            if self._stage.GetPrimAtPath(path).IsValid():
+                continue
+            jitter = np.array([
+                random.uniform(-SPARK_JITTER, SPARK_JITTER),
+                random.uniform(-SPARK_JITTER * 0.3, SPARK_JITTER * 0.3),
+                random.uniform(-SPARK_JITTER, SPARK_JITTER),
+            ])
+            light = UsdLux.SphereLight.Define(self._stage, path)
+            light.CreateIntensityAttr(SPARK_INTENSITY_PEAK)
+            light.CreateColorAttr(SPARK_COLOR)
+            light.CreateRadiusAttr(SPARK_RADIUS_LIGHT)
+            UsdGeom.Xformable(light.GetPrim()).AddTranslateOp().Set(
+                Gf.Vec3d(*(spark_origin + jitter).tolist()))
+            self._spark_prims.append([path, SPARK_LIFETIME_STEPS])
+
+    def _spawn_bubbles(self, origin: np.ndarray):
+        base_idx = self._fx_idx
+        self._fx_idx += 1
+        for i in range(BUBBLE_COUNT):
+            path = f"/World/WeldFX/Bubble_{base_idx:04d}_{i}"
+            if self._stage.GetPrimAtPath(path).IsValid():
+                continue
+            geom = UsdGeom.Sphere.Define(self._stage, path)
+            geom.CreateRadiusAttr(BUBBLE_RADIUS)
+            geom.CreateDisplayColorAttr([BUBBLE_COLOR])
+            offset = np.array([random.uniform(-0.04, 0.04),
+                                random.uniform(-0.02, 0.02), 0.0])
+            UsdGeom.Xformable(geom.GetPrim()).AddTranslateOp().Set(
+                Gf.Vec3d(*(origin + offset).tolist()))
+            rise_vel = np.array([
+                random.uniform(-0.003, 0.003),
+                random.uniform(-0.003, 0.003),
+                BUBBLE_RISE_SPEED * random.uniform(0.8, 1.2),
+            ])
+            self._bubble_prims.append([path, BUBBLE_LIFETIME_STEPS, rise_vel])
+
+    def _tick_particles(self):
+        survivors = []
+        for path, life in self._spark_prims:
+            prim = self._stage.GetPrimAtPath(path)
+            if not prim.IsValid():
+                continue
+            life -= 1
+            if life <= 0:
+                self._stage.RemovePrim(path)
+                continue
+            ratio = life / SPARK_LIFETIME_STEPS
+            UsdLux.SphereLight(prim).GetIntensityAttr().Set(
+                SPARK_INTENSITY_PEAK * (ratio ** 2))
+            survivors.append([path, life])
+        self._spark_prims = survivors
+
+        b_survivors = []
+        for path, life, vel in self._bubble_prims:
+            prim = self._stage.GetPrimAtPath(path)
+            if not prim.IsValid():
+                continue
+            life -= 1
+            if life <= 0:
+                self._stage.RemovePrim(path)
+                continue
+            xf   = UsdGeom.Xformable(prim)
+            t_op = next((op for op in xf.GetOrderedXformOps()
+                         if op.GetOpType() == UsdGeom.XformOp.TypeTranslate), None)
+            if t_op is not None:
+                t_op.Set(Gf.Vec3d(*(np.array(t_op.Get()) + vel).tolist()))
+            b_survivors.append([path, life, vel])
+        self._bubble_prims = b_survivors
 
 
 # ─── Isaac Sim 메인 루프 ─────────────────────────────────────────────────────
@@ -374,8 +695,11 @@ def main():
     # USD 로드
     omni.usd.get_context().open_stage(USD_PATH)
 
-    # 균열 마커 생성
-    create_crack_markers()
+    # 용접 판 + 마커 생성
+    spawn_weld_plate()
+
+    # 용접봉 생성 (ee_link 자식 prim)
+    spawn_weld_electrode()
 
     # World 생성
     world = World()
@@ -414,6 +738,13 @@ def main():
     # IK 제어기 생성 (DriveAPI 설정 포함)
     controller = ArmIKController(robot, ros_node)
 
+    # 용접 시스템 생성 (UR10 ee_link를 전극으로 사용)
+    stage    = omni.usd.get_context().get_stage()
+    weld_sys = WeldingSystem(stage, controller._ee)
+    print("[Main] ✓ WeldingSystem 생성 완료")
+    print(f"[Main]   용접 트리거 거리: {WELD_TRIGGER_DIST*100:.1f}cm")
+    print(f"[Main]   standoff = ELECTRODE_HEIGHT({ELECTRODE_HEIGHT*100:.0f}cm) + {WELD_TRIGGER_DIST*0.8*100:.1f}cm = {(ELECTRODE_HEIGHT+WELD_TRIGGER_DIST*0.8)*100:.1f}cm")
+
     # REACH 자세로 이동 (DriveAPI 경유 → 실제로 작동)
     reach_q = np.zeros(6)
     for i, jname in enumerate(UR10_JOINT_NAMES):
@@ -421,16 +752,49 @@ def main():
     controller._apply(reach_q)
     print("[Main] ✓ REACH_POSE DriveAPI 적용 (80프레임 안정화 대기 중...)")
 
-    print("\n[Main] 시뮬레이션 실행 중. 다른 터미널에서 목표 발행:")
-    print("  ros2 topic pub /tool_target_pose geometry_msgs/msg/PoseStamped \\")
-    print("    '{header: {frame_id: World}, pose: {position: {x: 1.0, y: 0.5, z: 1.0}}}' --once")
-    print("Ctrl+C로 종료\n")
+    print("\n[Main] 시뮬레이션 실행 중. Ctrl+C로 종료\n")
 
     # 메인 루프
+    prev_weld_state = WeldState.IDLE
+    return_wait     = 0                  # REACH_POSE 복귀 대기 카운트다운
+
     try:
         while simulation_app.is_running():
             world.step(render=True)
             controller.update()
+            weld_sys.step(at_target=controller._at_target)
+
+            curr_weld_state = weld_sys._state
+
+            # ── 복귀 대기 카운트다운 ────────────────────────────────────────
+            if return_wait > 0:
+                return_wait -= 1
+                if return_wait == 0:
+                    print("[Main] 복귀 완료 → weld_cycle_done 발행")
+                    ros_node.publish_weld_cycle_done()
+                    ros_node.corner_count = 0
+                    controller._returning = False
+                    ros_node.unlock()   # 다음 사이클 첫 코너 수신 허용
+
+            # ── 용접 완료 감지 (COOLDOWN → IDLE) ────────────────────────────
+            elif (prev_weld_state == WeldState.COOLDOWN
+                    and curr_weld_state == WeldState.IDLE
+                    and controller._at_target):
+                controller._at_target = False
+                ros_node.corner_count += 1
+                ros_node.publish_corner_ack()
+                print(f"[Main] corner {ros_node.corner_count}/4 완료 → corner_ack 발행")
+
+                if ros_node.corner_count >= 4 * WELD_WAYPOINTS_PER_EDGE:
+                    print(f"[Main] 전체 {4 * WELD_WAYPOINTS_PER_EDGE}점 완료 → REACH_POSE 복귀 시작")
+                    controller._returning = True
+                    controller._apply(reach_q)
+                    return_wait = 120   # ~2초 대기
+                else:
+                    ros_node.unlock()   # 다음 코너 수신 허용
+
+            prev_weld_state = curr_weld_state
+
     except KeyboardInterrupt:
         print("\n[Main] 종료 중...")
     finally:
