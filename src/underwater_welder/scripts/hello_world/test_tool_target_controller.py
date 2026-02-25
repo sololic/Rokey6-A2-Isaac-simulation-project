@@ -41,7 +41,7 @@ from omni.isaac.core.prims import XFormPrim
 
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, PointStamped
 from std_msgs.msg import Empty
 
 # ─── 용접 판 / 마커 상수 ────────────────────────────────────────────────────
@@ -55,7 +55,7 @@ WELD_COOLDOWN_STEPS  = 15/50    # ← 변경 가능: 냉각 대기 (15f ≈ 0.25
 # ────────────────────────────────────────────────────────────────────────────
 
 # ── 변당 웨이포인트 수 (green_marker_pnp_node.py의 WAYPOINTS_PER_EDGE와 동일해야 함) ─
-WELD_WAYPOINTS_PER_EDGE = 80  # ← 변경 시 green_marker_pnp_node.py도 같이 수정
+WELD_WAYPOINTS_PER_EDGE = 50/2  # ← 변경 시 green_marker_pnp_node.py도 같이 수정
 # 한 사이클 총 용접 점 수 = WELD_WAYPOINTS_PER_EDGE × 4
 # ────────────────────────────────────────────────────────────────────────────
 
@@ -86,12 +86,12 @@ PLATE_MASS       = 60.0
 PLATE_COLOR      = Gf.Vec3f(0.0, 0.0, 0.0)
 
 MARKER_PATH      = PLATE_PATH + "/GreenMarker"
-MARKER_SIZE      = 0.2
+MARKER_SIZE      = 0.1
 MARKER_THICKNESS = 0.001
 MARKER_COLOR     = Gf.Vec3f(0.0, 1.0, 0.0)
 
 # 마커 위치: (x=-0.2, y=1.0, z=1.24)  ← MARKER_XY와 동일
-PLATE_POS      = np.array([-0.2, 1.0, 1.24])
+PLATE_POS      = np.array([-0.21, 1.0, 1.14])
 PLATE_FRONT_Y  = float(PLATE_POS[1]) - PLATE_THICKNESS / 2.0   # 로봇이 접근하는 면
 
 # 용접봉 (ee_link 자식 prim → 팔과 같이 움직임)
@@ -201,16 +201,21 @@ class ToolTargetSubscriber(Node):
     def __init__(self):
         super().__init__('tool_target_controller')
         self._target_pos: np.ndarray | None = None
-        self._locked: bool = False   # True이면 이동 중 → 새 목표 무시
-        self.corner_count: int = 0   # 완료된 코너 수 (0~4)
+        self._locked: bool = False      # True이면 이동 중 → 새 목표 무시
+        self._servo_mode: bool = False  # True이면 서보 중 → standoff 미적용
+        self.corner_count: int = 0      # 완료된 코너 수 (0~4)
         self.create_subscription(PoseStamped, '/tool_target_pose', self._cb, 10)
         self._corner_ack_pub      = self.create_publisher(Empty, '/corner_ack',      10)
         self._weld_cycle_done_pub = self.create_publisher(Empty, '/weld_cycle_done', 10)
+        self._ee_pose_pub         = self.create_publisher(PointStamped, '/ee_pose',    10)
+        self._plate_pose_pub      = self.create_publisher(PointStamped, '/plate_pose', 10)
+        self.create_subscription(PoseStamped, '/ee_servo_cmd', self._servo_cb, 10)
         self.get_logger().info('/tool_target_pose 구독 시작')
 
     def _cb(self, msg: PoseStamped):
         if self._locked:
             return  # 이동 중: 새 목표 무시
+        self._servo_mode = False     # 용접 목표 → standoff 적용
         self._target_pos = np.array([
             msg.pose.position.x,
             msg.pose.position.y,
@@ -233,6 +238,40 @@ class ToolTargetSubscriber(Node):
 
     def publish_weld_cycle_done(self):
         self._weld_cycle_done_pub.publish(Empty())
+
+    def _servo_cb(self, msg: PoseStamped):
+        """시각 서보 명령: 잠금 없을 때만 목표 갱신 (WELDING 중 덮어쓰기 방지)"""
+        if self._locked:
+            return  # 용접 웨이포인트 수신 중 → 서보 잔류 메시지 무시
+        self._servo_mode = True      # 서보 모드 → standoff 미적용
+        self._target_pos = np.array([
+            msg.pose.position.x,
+            msg.pose.position.y,
+            msg.pose.position.z,
+        ])
+
+    def publish_ee_pose(self, pos: np.ndarray):
+        msg = PointStamped()
+        msg.header.stamp    = self.get_clock().now().to_msg()
+        msg.header.frame_id = "World"
+        msg.point.x = float(pos[0])
+        msg.point.y = float(pos[1])
+        msg.point.z = float(pos[2])
+        self._ee_pose_pub.publish(msg)
+
+    def publish_plate_pose(self):
+        """판 위치를 /plate_pose 로 발행 (green_marker_pnp_node가 구독)
+        point.x = PLATE_POS[0]  (판 중심 X)
+        point.y = PLATE_FRONT_Y (용접면 Y = plate_front_y)
+        point.z = PLATE_POS[2]  (판 중심 Z = plate_center_z)
+        """
+        msg = PointStamped()
+        msg.header.stamp    = self.get_clock().now().to_msg()
+        msg.header.frame_id = "World"
+        msg.point.x = float(PLATE_POS[0])
+        msg.point.y = float(PLATE_FRONT_Y)
+        msg.point.z = float(PLATE_POS[2])
+        self._plate_pose_pub.publish(msg)
 
     @property
     def target(self) -> np.ndarray | None:
@@ -397,8 +436,11 @@ class ArmIKController:
         _, quat_ee   = self._ee.get_world_pose()
         R_ee         = rotation_matrix_from_quaternion(np.array(quat_ee))
         elec_dir     = R_ee @ np.array([1.0, 0.0, 0.0])   # ee_link local-x → world
-        standoff_dist    = ELECTRODE_HEIGHT + WELD_TRIGGER_DIST * 0.8
-        effective_target = target - elec_dir * standoff_dist
+        if self._ros._servo_mode:
+            effective_target = target  # 서보: EE 위치 직접 목표 (standoff 미적용)
+        else:
+            standoff_dist    = ELECTRODE_HEIGHT + WELD_TRIGGER_DIST * 0.8
+            effective_target = target - elec_dir * standoff_dist
 
         # 6. 오차 계산
         error    = effective_target - ee_pos
@@ -762,6 +804,8 @@ def main():
         while simulation_app.is_running():
             world.step(render=True)
             controller.update()
+            ros_node.publish_ee_pose(controller._ee_pos())
+            ros_node.publish_plate_pose()
             weld_sys.step(at_target=controller._at_target)
 
             curr_weld_state = weld_sys._state
