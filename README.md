@@ -570,7 +570,7 @@ echo $ROS_DOMAIN_ID
 
 # 아이작 심 실행
 ~/isaacsim/./isaac-sim.sh
-```
+```bash
 아래 Content -> My Computer -> / -> home -> Rokey6-A2-Isaac-simulation-project(your folder) -> src -> underwater_welder -> jackal_and_ur10_2.usd
 jackal_and_ur10_2.usd 우클릭 후 open
 
@@ -578,7 +578,7 @@ jackal_and_ur10_2.usd 우클릭 후 open
 
 하단 Action Graph -> Edit Action Graph -> /jackal/ActionGraph -> ROS2 Context 클릭
 -> 오른쪽 ROS2Context Node -> Inputs -> domain_id 변경(echo $ROS_DOMAIN_ID 입력해서 뜬 도메인 아이디로)
-
+```
 ---
 
 ### 빠른 시작 (v2 기준)
