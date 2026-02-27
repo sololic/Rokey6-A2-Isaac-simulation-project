@@ -570,7 +570,8 @@ echo $ROS_DOMAIN_ID
 
 # 아이작 심 실행
 ~/isaacsim/./isaac-sim.sh
-```bash
+```
+```
 아래 Content -> My Computer -> / -> home -> Rokey6-A2-Isaac-simulation-project(your folder) -> src -> underwater_welder -> jackal_and_ur10_2.usd
 jackal_and_ur10_2.usd 우클릭 후 open
 
