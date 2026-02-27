@@ -6,8 +6,33 @@
 
 ---
 
-Isaac Sim 5.0 기반 수중 용접 로봇 시뮬레이션입니다.  
-Jackal 모바일 로봇 위에 탑재된 UR10 팔이 파도 환경에서 초록 마커를 비전으로 인식하고, 마커 테두리를 따라 자율 용접을 수행합니다.
+### 한 줄 요약
+Isaac Sim 기반 수중 환경에서 비전으로 균열을 감지하고 자동 용접하는 로봇 시뮬레이션
+
+### 핵심 특징
+- 🌊 **실시간 수중 물리**: 부력, 유체저항, 파도력 구현
+- 👁️ **비전 기반 자율 제어**: HSV + PnP로 마커 인식
+- 🤖 **ROS2 통합**: Isaac Sim ↔ 외부 노드 양방향 통신
+- ⚡ **자동 용접**: 61개 웨이포인트 자동 생성 및 추종
+
+---
+
+버전 1 실행 방법과 버전 2 실행 방법이 따로 나뉘어 이후에는 아래와 같이 설명드리겠습니다.
+
+**hello_world 폴더 안에 있는 파일 실행 방법을 v1** 
+
+**src/underwater_welder 폴더 안에 있는 파일 실행 방법을 v2**
+
+### 버전 차이점
+| 구분 | v1 (hello_world) | v2 (underwater_welder) |
+|------|------------------|------------------------|
+| **구조** | BaseSample 확장 | Standalone Python |
+| **실행** | Isaac Sim GUI 내부 | 터미널 직접 실행 |
+| **제어** | 상태머신 (6단계) | Phase 기반 (4단계) |
+| **장점** | 통합 환경, GUI 편의 | 독립 실행, 디버깅 용이 |
+| **단점** | 설치 복잡 | 경로 설정 필요 |
+
+**→ 두 버전 모두 동일한 결과, 편한 것 선택!**
 
 ---
 
@@ -21,7 +46,6 @@ Jackal 모바일 로봇 위에 탑재된 UR10 팔이 파도 환경에서 초록 
 6. [시스템 설계](#시스템-설계)
 7. [알고리즘 플로우차트](#알고리즘-플로우차트)
 8. [실행 방법](#실행-방법)
-9. [조정 포인트](#조정-포인트)
 
 ---
 
@@ -460,6 +484,7 @@ Y를 고정값으로 대체하는 이유: Jackal이 World Y 방향으로만 이�
 ## 실행 방법
 
 **v1**
+---
 ### 1. Isaac Sim 실행
 
 Isaac Sim을 실행하고 `Robotics Examples` 패널에서 `ROKEY → Water Environment`를 로드합니다.
@@ -490,42 +515,52 @@ python3 welding_scenario_node.py
 
 
 **v2**
-## 실행 순서 (Launch 순서)
+---
 
-### 1단계: 환경 소스
+### v2 실행 방법 (underwater_welder) ⭐ 권장
 
+#### 1단계: 환경 설정
 ```bash
 source /opt/ros/humble/setup.bash
 source ~/hamtaro/install/setup.bash
 ```
 
-### 2단계: Isaac Sim 시뮬레이터 실행
+#### 2단계: Isaac Sim 시뮬레이터
+```bash
+~/isaacsim/python.sh \
+  ~/hamtaro/src/underwater_welder/scripts/test_tool_target_controller.py
+```
 
+#### 3단계: 비전 노드
+```bash
+# 새 터미널
+python3 ~/hamtaro/src/underwater_welder/scripts/1_green_marker_pnp_node.py
+```
+
+#### 4단계: 모니터링 (선택)
+```bash
+# 토픽 확인
+ros2 topic list
+ros2 topic echo /tool_target_pose
+
+# 이미지 확인
+ros2 run rqt_image_view rqt_image_view
+```
+
+---
+
+### 빠른 시작 (v2 기준)
+
+**한 줄 실행 (터미널 1)**:
 ```bash
 ~/isaacsim/python.sh ~/hamtaro/src/underwater_welder/scripts/test_tool_target_controller.py
 ```
 
-- USD 씬 자동 로드 (`jackal_and_ur10_2.usd`)
-- ROS2 Bridge 자동 활성화
-- 시뮬레이션 시작까지 약 30~60초 대기
-
-### 3단계: 비전/용접 ROS2 노드 실행
-
+**한 줄 실행 (터미널 2)**:
 ```bash
-# 새 터미널
-source /opt/ros/humble/setup.bash
-source ~/hamtaro/install/setup.bash
 python3 ~/hamtaro/src/underwater_welder/scripts/1_green_marker_pnp_node.py
 ```
 
-### 4단계: 동작 확인
-
-```bash
-# 토픽 모니터링 (선택사항)
-ros2 topic echo /ee_pose
-ros2 topic echo /tool_target_pose
-ros2 topic list
-```
 
 ---
 
