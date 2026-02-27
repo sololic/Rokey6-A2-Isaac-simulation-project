@@ -1,17 +1,4 @@
 #!/usr/bin/env python3
-"""
-test_tool_target_controller.py
-/tool_target_pose 수신 → UR10 IK → 팔 제어 테스트
-
-실행:
-  ~/.local/share/ov/pkg/isaac_sim-*/python.sh \
-      .../hello_world/test_tool_target_controller.py
-
-테스트 명령 (다른 터미널):
-  ros2 topic pub /tool_target_pose geometry_msgs/msg/PoseStamped \
-      '{header: {frame_id: World}, pose: {position: {x: 1.0, y: 0.5, z: 1.0}}}' --once
-"""
-
 # ── Python 3.11용 ROS2 패키지 경로 추가 (SimulationApp 보다 반드시 먼저) ──────
 import sys
 _ROS2_PY311 = "/home/rokey/isaacsim/exts/isaacsim.ros2.bridge/humble/rclpy"
@@ -34,10 +21,11 @@ from enum import Enum, auto
 
 import numpy as np
 import omni.usd
-from pxr import UsdGeom, Gf, UsdPhysics, UsdLux
+from pxr import UsdGeom, Gf, UsdPhysics, UsdLux, UsdVol, UsdShade, Sdf
 from omni.isaac.core import World
 from omni.isaac.core.articulations import Articulation
 from omni.isaac.core.prims import XFormPrim
+from isaacsim.core.api.objects import DynamicCuboid
 
 import rclpy
 from rclpy.node import Node
@@ -78,20 +66,84 @@ BUBBLE_COLOR          = Gf.Vec3f(0.82, 0.92, 1.0)
 BUBBLE_RISE_SPEED     = 0.05
 BUBBLE_LIFETIME_STEPS = 60
 
+# ─── 주변 버블 상수 ───────────────────────────────────────────────────────────
+AMBIENT_BUBBLE_COUNT    = 25
+AMBIENT_BUBBLE_R_MIN    = 0.015
+AMBIENT_BUBBLE_R_MAX    = 0.06
+AMBIENT_BUBBLE_SPD_MIN  = 0.25   # m/s
+AMBIENT_BUBBLE_SPD_MAX  = 0.8    # m/s
+AMBIENT_BUBBLE_TOP_Z    = 8.0    # 수면 위 → 리셋
+AMBIENT_BUBBLE_BOT_Z    = -0.5   # 바닥
+
+# ─── 수중 물리 상수 ────────────────────────────────────────────────────────────
+WATER_DENSITY    = 1000.0   # [kg/m³]
+WATER_VISCOSITY  = 0.001    # [Pa·s]
+GRAVITY_ACC      = 9.81     # [m/s²]
+WATER_SURFACE_Z  = 3.0      # [m] 수면 높이
+
+DRAG_Cd          = 1.05
+RE_THRESHOLD     = 1000.0
+SURFACE_GRID_RES = 3
+
+WAVE_F_SURFACE   = 20.0     # 수평 파도력 [N]
+WAVE_F_VERTICAL  = 4.0      # 수직 파도력 [N]
+WAVE_Z_DECAY     = 0.2
+WAVE_UPDATE_SEC  = 5.0      # 파도 방향 전환 주기 [s]
+WAVE_AMP         = 0.15     # 파고 [m]
+WAVE_LEN         = 6.0      # 파장 [m]
+WAVE_SPEED       = 0.6      # 파속 [m/s]
+
+# ─── 수중 시각 효과 플래그 ──────────────────────────────────────────────────────
+ENABLE_WATER_VISUAL  = False      # True: VDB 볼륨 렌더링 활성화 / False: 물리만
+ENABLE_DEMO_CUBES    = True       # True: 부력·파도 시각화용 데모 큐브 6개 생성
+
+# 데모 큐브 상수
+DEMO_CUBE_MASSES  = [1.5, 2.0, 2.5, 3.0, 3.5, 4.0]   # 각 큐브 질량 [kg]
+DEMO_CUBE_RADIUS  = 3.5           # 링 배치 반경 [m]
+DEMO_CUBE_Z       = WATER_SURFACE_Z - 0.3              # 초기 Z [m]
+DEMO_CUBE_SIZE    = 0.25          # 큐브 한 변 길이 [m]
+DEMO_CUBE_COLOR   = np.array([0.3, 0.5, 0.9])          # 파란색
+
+VOL_SCATTERING       = 0.85
+VOL_ABSORPTION       = 0.85
+VOL_ANISOTROPY       = -0.75
+VOL_ALBEDO           = (0.04, 0.28, 0.45)  # 수중 청록색
+VOL_CENTER_Z         = 1.0       # 볼륨 중심 높이 [m]
+
+# 부력 등록 대상 (prim_path: 실제 USD 경로 확인 후 주석 해제)
+BUOYANCY_PRIM_CONFIGS = [
+    {"prim_path": "/jackal/base_link", "shape": "cube", "char_length": 0.5, "size": 0.5},
+]
+
 PLATE_PATH       = "/World/WeldPlate"
-PLATE_SIZE_X     = 0.5
-PLATE_SIZE_Z     = 0.5
+PLATE_SIZE_X     = 3.5    # 3개 마커 × 1.0m 간격 + 양쪽 여유
+PLATE_SIZE_Z     = 1.0    # 마커 Z 변화량(0.4m) + 여유
 PLATE_THICKNESS  = 0.025
 PLATE_MASS       = 60.0
 PLATE_COLOR      = Gf.Vec3f(0.0, 0.0, 0.0)
 
-MARKER_PATH      = PLATE_PATH + "/GreenMarker"
+# 마커 3개: X 1.0m 간격, Z 0.2m씩 높이 차이
+# 월드 기준: marker0=(-0.21, ~1.0, 1.14)  marker1=(0.79, ~1.0, 1.34)  marker2=(1.79, ~1.0, 1.54)
+MARKER_X_OFFSETS   = [-1.0, 0.0, 1.0]  # 판 중심 기준 X 오프셋 [m]
+JACKAL_MOVE_DIST     = 0.98               # 마커 간 이동 거리 [m]
+JACKAL_MOVE_FRAMES   = 90               # 이동 후 안정화 대기 프레임
+JACKAL_TURN_RATE     = math.radians(2.0) # kinematic 회전 속도 [rad/frame] (~45f per 90°)
+JACKAL_DRIVE_RATE    = 0.015            # kinematic 직진 속도 [m/frame] (~67f per 1m)
+JACKAL_CORRECT_RATE  = 0.003           # 보정 속도 [m/frame] (Phase2보다 느림)
+JACKAL_WHEEL_SPEED   = 60.0            # 휠 시각 효과용 DriveAPI 속도 [rad/s]
+JACKAL_MOVE_TOL      = 0.02            # Phase2 → correcting 전환 허용 오차 [m]
+JACKAL_CORRECT_TOL   = 0.001           # 보정 완료 허용 오차 [m] (1mm)
+JACKAL_YAW_TOL       = math.radians(1.0) # 목표 yaw 허용 오차 [rad] (~1°)
+
+MARKER_Z_OFFSETS = [-0.1, 0.0, 0.1]    # 판 중심 기준 Z 오프셋 [m]
+MARKER_PATHS     = [PLATE_PATH + f"/GreenMarker_{i}" for i in range(3)]
+MARKER_PATH      = MARKER_PATHS[0]      # 하위 호환
 MARKER_SIZE      = 0.1
 MARKER_THICKNESS = 0.001
 MARKER_COLOR     = Gf.Vec3f(0.0, 1.0, 0.0)
 
-# 마커 위치: (x=-0.2, y=1.0, z=1.24)  ← MARKER_XY와 동일
-PLATE_POS      = np.array([-0.21, 1.0, 1.14])
+# 판 중심 = 3개 마커의 X/Z 중앙
+PLATE_POS      = np.array([0.79, 1.0, 1.24])
 PLATE_FRONT_Y  = float(PLATE_POS[1]) - PLATE_THICKNESS / 2.0   # 로봇이 접근하는 면
 
 # 용접봉 (ee_link 자식 prim → 팔과 같이 움직임)
@@ -139,7 +191,6 @@ DH_D     = [0.1273*_S, 0.0,       0.0,        0.1639*_S, 0.1157*_S, 0.0922*_S]
 DH_A     = [0.0,      -0.612*_S, -0.5723*_S,  0.0,       0.0,       0.0      ]
 DH_ALPHA = [np.pi/2,   0.0,       0.0,         np.pi/2,  -np.pi/2,  0.0      ]
 
-
 # ─── FK / Jacobian ──────────────────────────────────────────────────────────
 def _dh(theta: float, d: float, a: float, alpha: float) -> np.ndarray:
     ct, st = np.cos(theta), np.sin(theta)
@@ -151,14 +202,12 @@ def _dh(theta: float, d: float, a: float, alpha: float) -> np.ndarray:
         [ 0,      0,      0,    1],
     ])
 
-
 def ur10_fk(q: np.ndarray) -> np.ndarray:
     """관절 각도 6개 → EE 변환 행렬 4x4 (UR10 base frame 기준)"""
     T = np.eye(4)
     for i in range(6):
         T = T @ _dh(q[i], DH_D[i], DH_A[i], DH_ALPHA[i])
     return T
-
 
 def position_jacobian(q: np.ndarray, T_wb: np.ndarray) -> np.ndarray:
     """수치 미분으로 위치 Jacobian 계산 (3×6, world frame)"""
@@ -170,7 +219,6 @@ def position_jacobian(q: np.ndarray, T_wb: np.ndarray) -> np.ndarray:
         J[:, i] = ((T_wb @ ur10_fk(q2))[:3, 3] - ee0) / eps
     return J
 
-
 def rotation_matrix_from_quaternion(quat: np.ndarray) -> np.ndarray:
     """쿼터니언 [w,x,y,z] → 3×3 회전 행렬"""
     w, x, y, z = quat
@@ -179,7 +227,6 @@ def rotation_matrix_from_quaternion(quat: np.ndarray) -> np.ndarray:
         [  2*(x*y+w*z), 1-2*(x*x+z*z),   2*(y*z-w*x)],
         [  2*(x*z-w*y),   2*(y*z+w*x), 1-2*(x*x+y*y)],
     ])
-
 
 def xform_to_mat4(prim: XFormPrim) -> np.ndarray:
     """Isaac Sim XFormPrim → 4×4 변환 행렬 (column-vector convention)"""
@@ -194,6 +241,282 @@ def xform_to_mat4(prim: XFormPrim) -> np.ndarray:
     T[:3, :3] = R
     T[:3,  3] = pos[:3]
     return T
+
+# ─── 수중 시각 효과 함수 ─────────────────────────────────────────────────────────
+def _setup_underwater_volume_vdb(stage):
+    """VDB 볼륨으로 수중 산란 효과 생성 (ENABLE_WATER_VISUAL=True 시 호출)"""
+    vol_path  = "/World/UnderwaterVolume"
+    mat_path  = "/World/Looks/UnderwaterVolMat"
+    if stage.GetPrimAtPath(vol_path).IsValid():
+        print("[UnderwaterVDB] 이미 존재, 스킵.")
+        return
+    vol = UsdVol.Volume.Define(stage, vol_path)
+    UsdGeom.Xformable(vol.GetPrim()).AddTranslateOp().Set(
+        Gf.Vec3d(0.0, 0.0, VOL_CENTER_Z))
+    field_path = vol_path + "/density"
+    fp = stage.DefinePrim(field_path, "OpenVDBAsset")
+    fp.CreateAttribute("fieldName", Sdf.ValueTypeNames.Token).Set("density")
+    vol.CreateFieldRelationship("density", Sdf.Path(field_path))
+    mat    = UsdShade.Material.Define(stage, mat_path)
+    shader = UsdShade.Shader.Define(stage, mat_path + "/Shader")
+    shader.CreateIdAttr("OmniVolume")
+    shader.CreateInput("scattering_color",
+                       Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(*VOL_ALBEDO))
+    shader.CreateInput("scattering_intensity",
+                       Sdf.ValueTypeNames.Float).Set(VOL_SCATTERING)
+    shader.CreateInput("absorption_color",
+                       Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(*VOL_ALBEDO))
+    shader.CreateInput("absorption_intensity",
+                       Sdf.ValueTypeNames.Float).Set(VOL_ABSORPTION)
+    shader.CreateInput("anisotropy",
+                       Sdf.ValueTypeNames.Float).Set(VOL_ANISOTROPY)
+    shader.CreateInput("density_field",
+                       Sdf.ValueTypeNames.Token).Set("density")
+    shader.CreateInput("density_multiplier",
+                       Sdf.ValueTypeNames.Float).Set(1.0)
+    mat.CreateVolumeOutput().ConnectToSource(shader.ConnectableAPI(), "out")
+    UsdShade.MaterialBindingAPI(vol.GetPrim()).Bind(
+        UsdShade.Material(mat),
+        UsdShade.Tokens.weakerThanDescendants,
+        "volume")
+    print("[UnderwaterVDB] 볼륨 생성 완료")
+
+def _apply_blue_material(stage, prim_path: str):
+    """데모 큐브에 파란색 OmniPBR 머티리얼 적용"""
+    mat_path = "/World/Looks/DemoCubeMat"
+    mat_sh   = mat_path + "/Shader"
+    if not stage.GetPrimAtPath(mat_path).IsValid():
+        mat    = UsdShade.Material.Define(stage, mat_path)
+        shader = UsdShade.Shader.Define(stage, mat_sh)
+        shader.SetSourceAsset("OmniPBR.mdl", "mdl")
+        shader.SetSourceAssetSubIdentifier("OmniPBR", "mdl")
+        shader.CreateIdAttr("OmniPBR")
+        shader.CreateInput("diffuse_color_constant",
+                           Sdf.ValueTypeNames.Color3f).Set(
+                               Gf.Vec3f(*DEMO_CUBE_COLOR.tolist()))
+        shader.CreateInput("reflection_roughness_constant",
+                           Sdf.ValueTypeNames.Float).Set(0.2)
+        shader.CreateInput("metallic_constant",
+                           Sdf.ValueTypeNames.Float).Set(0.0)
+        mat.CreateSurfaceOutput("mdl").ConnectToSource(shader.ConnectableAPI(), "out")
+        mat.CreateDisplacementOutput("mdl").ConnectToSource(shader.ConnectableAPI(), "out")
+        mat.CreateVolumeOutput("mdl").ConnectToSource(shader.ConnectableAPI(), "out")
+    prim = stage.GetPrimAtPath(prim_path)
+    if prim.IsValid():
+        UsdShade.MaterialBindingAPI(prim).Bind(
+            UsdShade.Material(stage.GetPrimAtPath(mat_path)))
+
+def spawn_demo_cubes(world, water):
+    """무게가 다른 6개의 큐브를 링 형태로 배치 → 부력·항력·파도력 등록"""
+    if not ENABLE_DEMO_CUBES:
+        return
+    stage = omni.usd.get_context().get_stage()
+    S = DEMO_CUBE_SIZE
+    N = len(DEMO_CUBE_MASSES)
+    for i, mass in enumerate(DEMO_CUBE_MASSES):
+        angle = 2.0 * math.pi * i / N
+        pos = np.array([
+            DEMO_CUBE_RADIUS * math.cos(angle),
+            DEMO_CUBE_RADIUS * math.sin(angle),
+            DEMO_CUBE_Z,
+        ])
+        path = f"/World/DemoCube_{i}"
+        world.scene.add(DynamicCuboid(
+            prim_path=path,
+            name=f"demo_cube_{i}",
+            position=pos,
+            scale=np.array([S, S, S]),
+            color=DEMO_CUBE_COLOR,
+            mass=mass,
+        ))
+        water.register(path, shape="cube", char_length=S, size=S)
+        _apply_blue_material(stage, path)
+        print(f"[DemoCube] {path}  mass={mass}kg  pos={np.round(pos,2)}")
+    print(f"[DemoCube] {N}개 생성 완료")
+
+
+# ─── 수중 물리 함수 ──────────────────────────────────────────────────────────────
+def _get_wave_height(x, y, t):
+    k = 2.0 * math.pi / WAVE_LEN
+    return WAVE_AMP * math.sin(k * (x + y) - WAVE_SPEED * t)
+
+
+def _calc_wave_force(z_local, wave_dir):
+    decay   = math.exp(-max(z_local, 0.0) / WAVE_Z_DECAY)
+    f_horiz = WAVE_F_SURFACE * decay
+    f_vert  = WAVE_F_VERTICAL * decay
+    return np.array([wave_dir[0]*f_horiz, wave_dir[1]*f_horiz, f_vert], dtype=np.float32)
+
+
+def _generate_points_cube(size: float, grid_res: int = SURFACE_GRID_RES):
+    half   = size / 2.0
+    volume = size ** 3
+    coords = np.linspace(-half, half, grid_res)
+    points, normals = [], []
+    for x in coords:
+        for y in coords:
+            for z in coords:
+                pt   = np.array([x, y, z])
+                norm = np.linalg.norm(pt)
+                points.append(pt)
+                normals.append(-pt / norm if norm > 1e-9 else None)
+    n = len(points)
+    return points, normals, volume / n, (size ** 2) / n
+
+
+def _generate_points_sphere(radius: float):
+    volume = (4.0 / 3.0) * np.pi * radius ** 3
+    r      = radius * 0.8
+    raw = [np.zeros(3),
+           np.array([ r, 0., 0.]), np.array([-r, 0., 0.]),
+           np.array([0.,  r, 0.]), np.array([0., -r, 0.]),
+           np.array([0., 0.,  r]), np.array([0., 0., -r])]
+    points, normals = [], []
+    for pt in raw:
+        norm = np.linalg.norm(pt)
+        points.append(pt)
+        normals.append(-pt / norm if norm > 1e-9 else None)
+    n = len(points)
+    return points, normals, volume / n, (np.pi * radius ** 2) / n
+
+
+def generate_sample_points(shape: str, **kwargs):
+    if shape == "cube":
+        return _generate_points_cube(kwargs["size"])
+    else:
+        return _generate_points_sphere(kwargs.get("radius", kwargs.get("size", 0.5) / 2.0))
+
+
+def compute_pressure_forces(local_points, local_normals, area_per_point,
+                             world_pos, R, surface_z):
+    force_list = []
+    for pt_local, n_local in zip(local_points, local_normals):
+        if n_local is None:
+            continue
+        pt_world = world_pos + R @ pt_local
+        h_depth  = surface_z - pt_world[2]
+        if h_depth <= 0.0:
+            continue
+        pressure = WATER_DENSITY * GRAVITY_ACC * h_depth
+        force    = pressure * area_per_point * (R @ n_local)
+        force_list.append((pt_world, force))
+    return force_list
+
+
+def compute_drag_forces(local_points, area_per_point, char_length,
+                         world_pos, R, surface_z, lin_vel, ang_vel):
+    force_list = []
+    for pt_local in local_points:
+        pt_world = world_pos + R @ pt_local
+        if surface_z - pt_world[2] <= 0.0:
+            continue
+        v_point = lin_vel + np.cross(ang_vel, pt_world - world_pos)
+        speed   = np.linalg.norm(v_point)
+        if speed < 1e-6:
+            continue
+        Re = WATER_DENSITY * speed * char_length / WATER_VISCOSITY
+        if Re < RE_THRESHOLD:
+            drag = -3.0 * np.pi * WATER_VISCOSITY * char_length * v_point
+        else:
+            drag = -0.5 * WATER_DENSITY * DRAG_Cd * area_per_point * speed * v_point
+        force_list.append((pt_world, drag))
+    return force_list
+
+
+class WaterPhysics:
+    """수중 물리 시스템: 부력 + 항력 + 파도력을 등록된 RigidPrim에 매 프레임 적용"""
+
+    def __init__(self):
+        self._wave_timer      = 0.0
+        self._wave_dir        = np.array([1.0, 0.0], dtype=np.float64)
+        self._wave_dir_target = np.array([1.0, 0.0], dtype=np.float64)
+        self._wave_dir_sign   = 1.0
+        self._registry        = []
+        self._rigid_prims     = {}   # prim_path → RigidPrim (setup() 이후)
+
+    def register(self, prim_path: str, shape: str, char_length: float, **kwargs):
+        pts, norms, _, area_per_pt = generate_sample_points(shape, **kwargs)
+        self._registry.append({
+            "prim_path":      prim_path,
+            "char_length":    char_length,
+            "local_points":   pts,
+            "local_normals":  norms,
+            "area_per_point": area_per_pt,
+        })
+        print(f"[Water] 등록: {prim_path}  shape={shape}  pts={len(pts)}")
+
+    def setup(self, world):
+        """world.reset() 이후에 호출. physics callback 등록."""
+        from isaacsim.core.prims import RigidPrim as _RP
+        for obj in self._registry:
+            path = obj["prim_path"]
+            try:
+                rp = _RP(prim_paths_expr=path)
+                self._rigid_prims[path] = rp
+                print(f"[Water] ✓ RigidPrim 등록: {path}")
+            except Exception as e:
+                print(f"[Water] ⚠ RigidPrim 등록 실패 ({path}): {e}")
+        world.add_physics_callback("water_physics_step", self.step)
+        print(f"[Water] ✓ physics callback 등록 완료  총={len(self._rigid_prims)}개")
+
+    def step(self, step_size: float):
+        if not self._rigid_prims:
+            return
+
+        # 파도 방향 업데이트
+        self._wave_timer += step_size
+        if self._wave_timer >= WAVE_UPDATE_SEC:
+            self._wave_timer = 0.0
+            angle = random.uniform(0.0, 2.0 * math.pi)
+            self._wave_dir_target = np.array([math.cos(angle), math.sin(angle)])
+            self._wave_dir_sign   = 1.0
+        if self._wave_timer >= WAVE_UPDATE_SEC * 0.5:
+            self._wave_dir_sign = -1.0
+        wave_dir_final  = self._wave_dir_target * self._wave_dir_sign
+        self._wave_dir += (wave_dir_final - self._wave_dir) * 0.02
+        self._wave_dir /= np.linalg.norm(self._wave_dir) + 1e-8
+        wave_mult  = math.sin(2.0 * math.pi * self._wave_timer / WAVE_UPDATE_SEC)
+        wave_mult *= 1.0 + 0.15 * math.sin(3.1 * self._wave_timer)
+
+        for obj in self._registry:
+            rp = self._rigid_prims.get(obj["prim_path"])
+            if rp is None:
+                continue
+            try:
+                positions, orientations = rp.get_world_poses()
+                world_pos = np.array(positions[0], dtype=np.float64)
+                lin_vel   = np.array(rp.get_linear_velocities()[0], dtype=np.float64)
+                ang_vel   = np.array(rp.get_angular_velocities()[0], dtype=np.float64)
+                R         = rotation_matrix_from_quaternion(np.array(orientations[0]))
+            except Exception:
+                continue
+
+            wave_h = _get_wave_height(float(world_pos[0]), float(world_pos[1]), self._wave_timer)
+            surf_z = WATER_SURFACE_Z + wave_h
+
+            def _apply(pt_w, fv):
+                try:
+                    rp.apply_forces_and_torques_at_pos(
+                        forces=fv.astype(np.float32).reshape(1, 3),
+                        torques=np.zeros((1, 3), dtype=np.float32),
+                        positions=pt_w.astype(np.float32).reshape(1, 3),
+                        is_global=True)
+                except Exception:
+                    pass
+
+            for pt_w, fv in compute_pressure_forces(
+                    obj["local_points"], obj["local_normals"], obj["area_per_point"],
+                    world_pos, R, surf_z):
+                _apply(pt_w, fv)
+
+            for pt_w, fv in compute_drag_forces(
+                    obj["local_points"], obj["area_per_point"], obj["char_length"],
+                    world_pos, R, surf_z, lin_vel, ang_vel):
+                _apply(pt_w, fv)
+
+            z_local = float(world_pos[2]) - surf_z
+            f_wave  = _calc_wave_force(z_local, self._wave_dir) * wave_mult
+            _apply(world_pos, f_wave)
 
 
 # ─── ROS2 구독 노드 ──────────────────────────────────────────────────────────
@@ -519,18 +842,23 @@ def spawn_weld_plate():
     UsdPhysics.MassAPI.Apply(prim).CreateMassAttr(PLATE_MASS)
     UsdPhysics.RigidBodyAPI(prim).CreateKinematicEnabledAttr(True)
 
-    # 초록 정사각형 마커 (판 앞면에 부착)
-    marker = UsdGeom.Cube.Define(stage, MARKER_PATH)
-    marker.CreateDisplayColorAttr([MARKER_COLOR])
-    mxf = UsdGeom.Xformable(stage.GetPrimAtPath(MARKER_PATH))
+    # 초록 정사각형 마커 3개 (판 앞면에 부착, 위치/높이 각각 다름)
     sx = (MARKER_SIZE / 2.0) / (PLATE_SIZE_X / 2.0)
     sz = (MARKER_SIZE / 2.0) / (PLATE_SIZE_Z / 2.0)
     sy = MARKER_THICKNESS / PLATE_THICKNESS
-    mxf.AddTranslateOp().Set(Gf.Vec3d(0.0, -1.0 - sy, 0.0))  # 앞면(-y)에 부착
-    mxf.AddScaleOp().Set(Gf.Vec3f(sx, sy, sz))
+    for i, (mx_off, mz_off) in enumerate(zip(MARKER_X_OFFSETS, MARKER_Z_OFFSETS)):
+        local_x = mx_off / (PLATE_SIZE_X / 2.0)
+        local_z = mz_off / (PLATE_SIZE_Z / 2.0)
+        marker = UsdGeom.Cube.Define(stage, MARKER_PATHS[i])
+        marker.CreateDisplayColorAttr([MARKER_COLOR])
+        mxf = UsdGeom.Xformable(stage.GetPrimAtPath(MARKER_PATHS[i]))
+        mxf.AddTranslateOp().Set(Gf.Vec3d(local_x, -1.0 - sy, local_z))
+        mxf.AddScaleOp().Set(Gf.Vec3f(sx, sy, sz))
+        world_x = PLATE_POS[0] + mx_off
+        world_z = PLATE_POS[2] + mz_off
+        print(f"[Weld] GreenMarker_{i} 생성  world=({world_x:.2f}, {PLATE_FRONT_Y:.3f}, {world_z:.2f})")
 
-    print(f"[Weld] WeldPlate spawned  pos={PLATE_POS}")
-    print(f"[Weld] GreenMarker spawned  size={MARKER_SIZE}x{MARKER_SIZE}m")
+    print(f"[Weld] WeldPlate spawned  pos={PLATE_POS}  size=({PLATE_SIZE_X}×{PLATE_SIZE_Z}m)")
     print(f"[Weld] PLATE_FRONT_Y={PLATE_FRONT_Y:.4f}")
 
 
@@ -727,6 +1055,87 @@ class WeldingSystem:
         self._bubble_prims = b_survivors
 
 
+# ─── Jackal 휠 속도 제어 ──────────────────────────────────────────────────────
+_WHEEL_JOINT_NAMES = [
+    "front_left_wheel_joint",
+    "front_right_wheel_joint",
+    "rear_left_wheel_joint",
+    "rear_right_wheel_joint",
+]
+
+def _setup_ambient_bubbles(stage) -> list:
+    """주변 환경 버블 25개를 생성하고 상태 리스트 반환."""
+    random.seed(80)
+    bubbles = []
+    for i in range(AMBIENT_BUBBLE_COUNT):
+        path = f"/World/AmbientBubbles/bubble_{i:02d}"
+        sph  = UsdGeom.Sphere.Define(stage, path)
+        r    = random.uniform(AMBIENT_BUBBLE_R_MIN, AMBIENT_BUBBLE_R_MAX)
+        sph.CreateRadiusAttr(r)
+        x = random.uniform(-5.0, 5.0)
+        y = random.uniform(-5.0, 5.0)
+        z = random.uniform(AMBIENT_BUBBLE_BOT_Z, AMBIENT_BUBBLE_TOP_Z)
+        UsdGeom.Xformable(sph).AddTranslateOp().Set(Gf.Vec3f(x, y, z))
+        sph.CreateDisplayColorAttr([(0.65, 0.82, 1.0)])
+        bubbles.append({"path": path, "x": x, "y": y, "z": z,
+                         "speed": random.uniform(AMBIENT_BUBBLE_SPD_MIN, AMBIENT_BUBBLE_SPD_MAX)})
+    print(f"[Bubble] 주변 버블 {len(bubbles)}개 생성 완료")
+    return bubbles
+
+
+def _step_ambient_bubbles(stage, bubbles: list, dt: float = 1.0 / 60.0):
+    """메인 루프에서 매 프레임 호출 — 버블 위치 업데이트."""
+    for b in bubbles:
+        b["z"] += b["speed"] * dt
+        if b["z"] > AMBIENT_BUBBLE_TOP_Z:
+            b["z"] = AMBIENT_BUBBLE_BOT_Z
+            b["x"] = random.uniform(-5.0, 5.0)
+            b["y"] = random.uniform(-5.0, 5.0)
+        prim = stage.GetPrimAtPath(b["path"])
+        if prim.IsValid():
+            attr = prim.GetAttribute("xformOp:translate")
+            if attr:
+                attr.Set(Gf.Vec3f(b["x"], b["y"], b["z"]))
+
+
+def _setup_wheel_drives(stage) -> dict:
+    """Stage 순회로 휠 조인트 DriveAPI 탐색·초기화 후 캐시 딕셔너리 반환."""
+    drives = {}
+    for prim in stage.Traverse():
+        ppath = str(prim.GetPath())
+        for wname in _WHEEL_JOINT_NAMES:
+            if wname not in drives and ppath.endswith(wname):
+                drive = UsdPhysics.DriveAPI.Get(prim, "angular")
+                if not drive:
+                    drive = UsdPhysics.DriveAPI.Apply(prim, "angular")
+                drive.GetStiffnessAttr().Set(0.0)
+                drive.GetDampingAttr().Set(10_000_000.0)
+                drive.GetMaxForceAttr().Set(10_000_000.0)
+                drive.GetTargetVelocityAttr().Set(0.0)
+                drives[wname] = drive
+                break
+    found = list(drives.keys())
+    print(f"[WheelDrive] 발견된 휠 조인트 {len(found)}/4: {found}")
+    if len(found) < 4:
+        print(f"[WheelDrive] ⚠ 일부 휠 조인트를 찾지 못함! USD 경로 확인 필요")
+    return drives
+
+
+def _set_wheel_velocities(drives: dict, fl: float, fr: float, rl: float = None, rr: float = None):
+    """캐시된 DriveAPI로 Jackal 휠 속도 설정 [rad/s]. 양수=전진, 음수=후진."""
+    if rl is None: rl = fl
+    if rr is None: rr = fr
+    vel_map = {
+        "front_left_wheel_joint":  fl,
+        "front_right_wheel_joint": fr,
+        "rear_left_wheel_joint":   rl,
+        "rear_right_wheel_joint":  rr,
+    }
+    for wname, vel in vel_map.items():
+        if wname in drives:
+            drives[wname].GetTargetVelocityAttr().Set(vel)
+
+
 # ─── Isaac Sim 메인 루프 ─────────────────────────────────────────────────────
 def main():
     print("=" * 60)
@@ -740,6 +1149,10 @@ def main():
     # 용접 판 + 마커 생성
     spawn_weld_plate()
 
+    # 수중 시각 효과 (VDB 볼륨)
+    if ENABLE_WATER_VISUAL:
+        _setup_underwater_volume_vdb(omni.usd.get_context().get_stage())
+
     # 용접봉 생성 (ee_link 자식 prim)
     spawn_weld_electrode()
 
@@ -747,6 +1160,16 @@ def main():
     world = World()
     world.scene.add_default_ground_plane()
     robot = Articulation(prim_path=ROBOT_PATH)
+
+    # 수중 물리 시스템 생성 및 정적 객체 등록 (world.reset() 이전)
+    water = WaterPhysics()
+    for cfg in BUOYANCY_PRIM_CONFIGS:
+        water.register(
+            cfg["prim_path"], cfg["shape"], cfg["char_length"],
+            **{k: v for k, v in cfg.items() if k not in ("prim_path", "shape", "char_length")}
+        )
+    # 데모 큐브 생성 + 부력 등록 (scene.add는 world.reset() 이전 필요)
+    spawn_demo_cubes(world, water)
 
     # ROS2 초기화
     rclpy.init()
@@ -781,9 +1204,17 @@ def main():
     controller = ArmIKController(robot, ros_node)
 
     # 용접 시스템 생성 (UR10 ee_link를 전극으로 사용)
-    stage    = omni.usd.get_context().get_stage()
-    weld_sys = WeldingSystem(stage, controller._ee)
+    stage         = omni.usd.get_context().get_stage()
+    weld_sys      = WeldingSystem(stage, controller._ee)
+    wheel_drives  = _setup_wheel_drives(stage)
+    ambient_bubbles = _setup_ambient_bubbles(stage)
+
     print("[Main] ✓ WeldingSystem 생성 완료")
+
+    # 수중 물리 RigidPrim 래핑 (world.reset() 이후 실행)
+    water.setup(world)
+    total_reg = len(BUOYANCY_PRIM_CONFIGS) + (len(DEMO_CUBE_MASSES) if ENABLE_DEMO_CUBES else 0)
+    print(f"[Main] ✓ WaterPhysics 생성 완료  등록={total_reg}개")
     print(f"[Main]   용접 트리거 거리: {WELD_TRIGGER_DIST*100:.1f}cm")
     print(f"[Main]   standoff = ELECTRODE_HEIGHT({ELECTRODE_HEIGHT*100:.0f}cm) + {WELD_TRIGGER_DIST*0.8*100:.1f}cm = {(ELECTRODE_HEIGHT+WELD_TRIGGER_DIST*0.8)*100:.1f}cm")
 
@@ -798,11 +1229,23 @@ def main():
 
     # 메인 루프
     prev_weld_state = WeldState.IDLE
-    return_wait     = 0                  # REACH_POSE 복귀 대기 카운트다운
+    return_wait     = 0       # REACH_POSE 복귀 대기 카운트다운
+    move_wait       = 0       # Jackal 도달 후 안정화 대기 카운트다운
+    marker_idx      = 0       # 현재 용접 중인 마커 인덱스 (0~2)
+    jackal_xf       = XFormPrim(prim_path="/jackal")
+    # Jackal 이동 상태 머신: "idle" | "turning_x" | "driving_x"
+    jackal_phase    = "idle"
+    jackal_target_x = 0.0
+    jackal_move_cnt = 0
+    # 용접 중 위치 락 (밀림 방지)
+    _lp, _lq        = jackal_xf.get_world_pose()
+    jackal_lock_pos  = np.array(_lp, dtype=float)
+    jackal_lock_quat = np.array(_lq, dtype=float)
 
     try:
         while simulation_app.is_running():
             world.step(render=True)
+            _step_ambient_bubbles(stage, ambient_bubbles)
             controller.update()
             ros_node.publish_ee_pose(controller._ee_pos())
             ros_node.publish_plate_pose()
@@ -810,11 +1253,102 @@ def main():
 
             curr_weld_state = weld_sys._state
 
-            # ── 복귀 대기 카운트다운 ────────────────────────────────────────
+            # ── REACH_POSE 복귀 대기 → 완료 시 Jackal 이동 시작 ────────────
             if return_wait > 0:
                 return_wait -= 1
                 if return_wait == 0:
-                    print("[Main] 복귀 완료 → weld_cycle_done 발행")
+                    marker_idx += 1
+                    if marker_idx < len(MARKER_X_OFFSETS):
+                        pos, _ = jackal_xf.get_world_pose()
+                        jackal_target_x = float(pos[0]) + JACKAL_MOVE_DIST
+                        jackal_phase    = "turning_x"
+                        jackal_move_cnt = 0
+                        _set_wheel_velocities(wheel_drives, JACKAL_WHEEL_SPEED, -JACKAL_WHEEL_SPEED,
+                                              JACKAL_WHEEL_SPEED, -JACKAL_WHEEL_SPEED)
+                        print(f"[Main] 마커 {marker_idx-1} 완료 → Phase1 CW회전 시작 (목표X={jackal_target_x:.2f}m)")
+                    else:
+                        print("[Main] 전체 마커 용접 완료!")
+
+            # ── Jackal 3단계 kinematic 이동 상태 머신 ───────────────────
+            elif jackal_phase != "idle":
+                pos, quat = jackal_xf.get_world_pose()
+                pos  = np.array(pos,  dtype=float)
+                quat = np.array(quat, dtype=float)
+                qw, qx, qy, qz = quat[0], quat[1], quat[2], quat[3]
+                cur_yaw = math.atan2(2*(qw*qz + qx*qy), 1 - 2*(qy*qy + qz*qz))
+                jackal_move_cnt += 1
+
+                def _yaw_to_quat(yaw):
+                    h = yaw / 2.0
+                    return np.array([math.cos(h), 0.0, 0.0, math.sin(h)])
+
+                if jackal_phase == "turning_x":
+                    # kinematic CW 회전 → yaw 0°
+                    # XYZ는 jackal_lock_pos에 고정, yaw만 변경 (회전 중 위치 흘림 방지)
+                    yaw_err = cur_yaw - 0.0
+                    if yaw_err >  math.pi: yaw_err -= 2*math.pi
+                    if yaw_err < -math.pi: yaw_err += 2*math.pi
+                    if jackal_move_cnt % 30 == 0:
+                        print(f"[Main] Phase1 CW회전  yaw={math.degrees(cur_yaw):.1f}°  err={math.degrees(yaw_err):.1f}°")
+                    if abs(yaw_err) <= JACKAL_YAW_TOL:
+                        jackal_xf.set_world_pose(jackal_lock_pos, _yaw_to_quat(0.0))
+                        jackal_phase = "driving_x"
+                        jackal_move_cnt = 0
+                        _set_wheel_velocities(wheel_drives, JACKAL_WHEEL_SPEED, JACKAL_WHEEL_SPEED,
+                                              JACKAL_WHEEL_SPEED, JACKAL_WHEEL_SPEED)
+                        print(f"[Main] Phase2: +X 직진 시작 (→{jackal_target_x:.2f}m)")
+                    else:
+                        step = min(JACKAL_TURN_RATE, abs(yaw_err)) * (-1.0 if yaw_err > 0 else 1.0)
+                        jackal_xf.set_world_pose(jackal_lock_pos, _yaw_to_quat(cur_yaw + step))
+
+                elif jackal_phase == "driving_x":
+                    # X만 이동, Y/Z는 jackal_lock_pos 기준으로 고정
+                    cur_x = pos[0]
+                    dx = jackal_target_x - cur_x
+                    if jackal_move_cnt % 30 == 0:
+                        print(f"[Main] Phase2 직진  X={cur_x:.3f}→{jackal_target_x:.2f}  남은={dx:.3f}m")
+                    if abs(dx) <= JACKAL_MOVE_TOL:
+                        print(f"[Main] Phase2→보정  실제X={cur_x:.4f}  목표X={jackal_target_x:.4f}  오차={dx*100:.2f}cm")
+                        _set_wheel_velocities(wheel_drives, JACKAL_CORRECT_RATE * 200,
+                                              JACKAL_CORRECT_RATE * 200,
+                                              JACKAL_CORRECT_RATE * 200,
+                                              JACKAL_CORRECT_RATE * 200)
+                        jackal_phase    = "correcting"
+                        jackal_move_cnt = 0
+                    else:
+                        step = min(JACKAL_DRIVE_RATE, abs(dx)) * (1.0 if dx > 0 else -1.0)
+                        moving = jackal_lock_pos.copy()
+                        moving[0] = cur_x + step
+                        jackal_xf.set_world_pose(moving, _yaw_to_quat(0.0))
+
+                elif jackal_phase == "correcting":
+                    # 느린 속도로 정확한 위치에 도달
+                    cur_x = pos[0]
+                    dx = jackal_target_x - cur_x
+                    if jackal_move_cnt % 10 == 0:
+                        print(f"[Main] 보정 중  X={cur_x:.4f}→{jackal_target_x:.4f}  오차={dx*100:.2f}cm")
+                    if abs(dx) <= JACKAL_CORRECT_TOL:
+                        print(f"[Main] 보정 완료  최종X={cur_x:.4f}  잔여오차={dx*1000:.1f}mm")
+                        _set_wheel_velocities(wheel_drives, 0.0, 0.0, 0.0, 0.0)
+                        final_pos = jackal_lock_pos.copy()
+                        final_pos[0] = cur_x          # 실제 도착 위치 그대로 lock
+                        jackal_xf.set_world_pose(final_pos, _yaw_to_quat(0.0))
+                        jackal_lock_pos  = final_pos.copy()
+                        jackal_lock_quat = _yaw_to_quat(0.0)
+                        jackal_phase    = "idle"
+                        jackal_move_cnt = 0
+                        move_wait       = JACKAL_MOVE_FRAMES
+                    else:
+                        step = min(JACKAL_CORRECT_RATE, abs(dx)) * (1.0 if dx > 0 else -1.0)
+                        moving = jackal_lock_pos.copy()
+                        moving[0] = cur_x + step
+                        jackal_xf.set_world_pose(moving, _yaw_to_quat(0.0))
+
+            # ── Jackal 안정화 대기 ────────────────────────────────────────
+            elif move_wait > 0:
+                move_wait -= 1
+                if move_wait == 0:
+                    print(f"[Main] Jackal 안정화 완료 → weld_cycle_done 발행 (마커 {marker_idx})")
                     ros_node.publish_weld_cycle_done()
                     ros_node.corner_count = 0
                     controller._returning = False
@@ -836,6 +1370,10 @@ def main():
                     return_wait = 120   # ~2초 대기
                 else:
                     ros_node.unlock()   # 다음 코너 수신 허용
+
+            # ── 용접 중 위치 강제 고정 (매 프레임 lock 위치 유지) ────────────
+            if (jackal_phase == "idle" and move_wait == 0 and return_wait == 0):
+                jackal_xf.set_world_pose(jackal_lock_pos, jackal_lock_quat)
 
             prev_weld_state = curr_weld_state
 
