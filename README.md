@@ -518,22 +518,39 @@ python3 welding_scenario_node.py
 
 ### v2 실행 방법 (underwater_welder) ⭐ 권장
 
+#### 0단계: 도메인 아이디 확인
+```bash
+echo $ROS_DOMAIN_ID
+# 만약 107이 아닐경우
+nano ~/.bashrc
+```
+```bash
+# 맨 아래에 추가
+export ROS_DOMAIN_ID=107
+```
+```bash
+source ~/.bashrc
+```
+
 #### 1단계: 환경 설정
 ```bash
 source /opt/ros/humble/setup.bash
-source ~/hamtaro/install/setup.bash
+source ~/Rokey6-A2-Isaac-simulation-project
+/install/setup.bash
 ```
 
 #### 2단계: Isaac Sim 시뮬레이터
 ```bash
 ~/isaacsim/python.sh \
-  ~/hamtaro/src/underwater_welder/scripts/test_tool_target_controller.py
+  ~/Rokey6-A2-Isaac-simulation-project
+/src/underwater_welder/scripts/test_tool_target_controller.py
 ```
 
 #### 3단계: 비전 노드
 ```bash
 # 새 터미널
-python3 ~/hamtaro/src/underwater_welder/scripts/1_green_marker_pnp_node.py
+python3 ~/Rokey6-A2-Isaac-simulation-project
+/src/underwater_welder/scripts/1_green_marker_pnp_node.py
 ```
 
 #### 4단계: 모니터링 (선택)
@@ -545,6 +562,22 @@ ros2 topic echo /tool_target_pose
 # 이미지 확인
 ros2 run rqt_image_view rqt_image_view
 ```
+
+#### 5단계: ros 통신이 안될때 (선택)
+```bash
+# 도메인 아이디 확인 이후 isaacsim 내부에서 변경
+echo $ROS_DOMAIN_ID
+
+# 아이작 심 실행
+~/isaacsim/./isaac-sim.sh
+```
+아래 Content -> My Computer -> / -> home -> Rokey6-A2-Isaac-simulation-project(your folder) -> src -> underwater_welder -> jackal_and_ur10_2.usd
+jackal_and_ur10_2.usd 우클릭 후 open
+
+상단 Window -> Graph Editors -> Action Graph 클릭
+
+하단 Action Graph -> Edit Action Graph -> /jackal/ActionGraph -> ROS2 Context 클릭
+-> 오른쪽 ROS2Context Node -> Inputs -> domain_id 변경(echo $ROS_DOMAIN_ID 입력해서 뜬 도메인 아이디로)
 
 ---
 
