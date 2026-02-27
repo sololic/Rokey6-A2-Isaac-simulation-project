@@ -159,7 +159,6 @@ src/underwater_welder/
 │   ├── jackal_ur10_underwater_demo.py     # 수중 물리 데모
 │   └── hello_world/
 │       └── test_tool_target_controller.py # Isaac Sim 확장 복사본
-└── README.md
 ```
 
 ---
@@ -185,6 +184,7 @@ opencv-python>=4.8.0
 
 cd ~/isaacsim/extension_examples/hello_world
 에 /hello_world 안에 있는 아래 파일을 옮겨서 실행하여야합니다
+
 water_env.py               
 welding_scenario_node.py    
 ur10_ik.py                  
